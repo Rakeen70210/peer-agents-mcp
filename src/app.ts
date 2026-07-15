@@ -31,8 +31,8 @@ import {
   verifyMessage,
 } from "./prompts.js";
 import { AntigravityHeadlessProvider } from "./providers/antigravity-headless.js";
+import { createGrokProvider } from "./providers/grok-factory.js";
 import {
-  GrokHeadlessProvider,
   isLikelyResumeFailure,
   sanitizeWorktreeName,
 } from "./providers/grok-headless.js";
@@ -204,7 +204,7 @@ export function createApp(options: AppOptions = {}) {
   const recentTurnCount = options.recentTurnCount ?? 8;
 
   const providers: Record<PeerProviderName, PeerProvider> = {
-    grok: options.providers?.grok ?? new GrokHeadlessProvider(),
+    grok: options.providers?.grok ?? createGrokProvider(),
     antigravity:
       options.providers?.antigravity ?? new AntigravityHeadlessProvider(),
   };

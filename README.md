@@ -72,8 +72,22 @@ Async jobs use a separate timeout from synchronous turns:
 - `PEER_AGENTS_JOB_TIMEOUT_MS` — default **30 minutes** (`1800000`)
 - `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional per-provider overrides
 - `PEER_AGENTS_JOB_GC_MAX_AGE_MS` — terminal job retention (default 7 days)
+- `PEER_AGENTS_GROK_TRANSPORT` — `headless` (default) or `acp` for warm process pool
+- `PEER_AGENTS_GROK_ACP_MAX_CLIENTS` — max concurrent ACP processes (default 4)
+- `PEER_AGENTS_GROK_ACP_IDLE_MS` — idle recycle for ACP processes (default 5 minutes)
 
 Keep the MCP server process alive for the duration of a job.
+
+### Grok transport: headless vs ACP
+
+| | `headless` (default) | `acp` |
+|--|----------------------|-------|
+| Invocation | `grok --prompt-file` each turn | Long-lived `grok agent stdio` per cwd |
+| Latency | Cold start every turn | Warm process; multi-turn reuses process + session |
+| CLI features | Full flag matrix (sandbox, json-schema, worktree, …) | Subset (always-approve); structured findings via prompt |
+| Enable | *(default)* | `PEER_AGENTS_GROK_TRANSPORT=acp` |
+
+Prefer **headless** for one-shot reviews with strict sandboxing. Prefer **acp** when you run many follow-up `peer_turn`s and want lower process-startup cost.
 
 ## How other agents use it
 
@@ -168,6 +182,7 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | Risk / security | Elevated `--effort` and optional `--check` self-verify |
 | Specialists | Packaged `--agent` for security review / architecture planning |
 | Async progress | `--output-format streaming-json` + `progress` on `peer_job_status` |
+| ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
 
 ## Design notes
