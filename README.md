@@ -26,20 +26,47 @@ Smart routing happens automatically based on the type of request.
 
 ## Available tools
 
-| Tool              | Purpose                                      | Routed to     |
-|-------------------|----------------------------------------------|---------------|
-| `peer_review_diff` | Review a unified diff or patch               | Grok (usually) |
-| `peer_plan`        | Create an implementation plan                | Grok          |
-| `peer_debug`       | Diagnose failures from logs/stack traces     | Grok          |
-| `peer_verify`      | Check test/build output for safety           | Grok          |
-| `peer_ask`         | General grounded Q&A                         | Antigravity   |
-| `peer_debate`      | Independently compare Plan A vs Plan B       | Grok          |
-| `peer_turn`        | Continue a multi-turn peer session           | Same peer     |
-| `peer_compare`     | Low-level side-by-side call to both CLIs     | Both          |
+| Tool                   | Purpose                                      | Routed to     |
+|------------------------|----------------------------------------------|---------------|
+| `peer_review_diff`     | Review a unified diff or patch               | Grok (usually) |
+| `peer_plan`            | Create an implementation plan                | Grok          |
+| `peer_debug`           | Diagnose failures from logs/stack traces     | Grok          |
+| `peer_verify`          | Check test/build output for safety           | Grok          |
+| `peer_ask`             | General grounded Q&A                         | Antigravity   |
+| `peer_debate`          | Independently compare Plan A vs Plan B       | Grok          |
+| `peer_turn`            | Continue a multi-turn peer session           | Same peer     |
+| `peer_turn_async`      | Long-running follow-up turn (background job) | Same peer     |
+| `peer_implement_async` | Cold-start Grok implementation handoff (job) | Grok          |
+| `peer_job_status`      | Poll a background job                        | —             |
+| `peer_job_cancel`      | Cancel a background job                      | —             |
+| `peer_compare`         | Low-level side-by-side call to both CLIs     | Both          |
 
 Additional session tools: `peer_summarize`, `peer_transcript`, `peer_list_sessions`, `peer_reset`, and `peer_health`.
 
 All routed tools accept full file contents via the `files` parameter and diffs via `diff`. Never send summaries — send the actual content.
+
+## Long-running async jobs
+
+Large implementation handoffs can exceed the MCP client's synchronous tool timeout. Use the async path instead of blocking on `peer_turn`:
+
+1. Start work with `peer_implement_async` (cold start) or `peer_turn_async` (existing session).
+2. Continue local work while the peer runs.
+3. Poll `peer_job_status` every **30–60 seconds** (avoid aggressive polling).
+4. When `status` is `succeeded`, read `result` and continue with `peer_turn` if needed.
+5. Use `peer_job_cancel` to stop a queued/running job owned by this MCP process.
+
+Terminal statuses: `succeeded`, `failed`, `timed_out`, `cancelled`, `orphaned`.
+
+Idempotency: retries with the same `idempotency_key` return the same job (running or sticky terminal). After `timed_out` / `cancelled` / `failed`, use a **new** key to retry the work.
+
+Jobs and completed results are stored under `~/.peer-agents/jobs/`. Live provider processes do **not** survive MCP server restarts; non-terminal jobs are marked `orphaned` on hydrate (unless the session already committed the operation, which recovers as `succeeded`).
+
+Async jobs use a separate timeout from synchronous turns:
+
+- `PEER_AGENTS_JOB_TIMEOUT_MS` — default **30 minutes** (`1800000`)
+- `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional per-provider overrides
+
+Keep the MCP server process alive for the duration of a job.
 
 ## How other agents use it
 
@@ -103,7 +130,10 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `ANTIGRAVITY_COMMAND` — path to agy binary (default: `agy`)
 - `GROK_ARGS` / `ANTIGRAVITY_ARGS` — JSON array of extra CLI args
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
-- `PEER_AGENTS_TURN_TIMEOUT_MS` — per-turn timeout (default 120s for Grok, 300s for Antigravity)
+- `PEER_AGENTS_TURN_TIMEOUT_MS` — per-turn synchronous timeout (default 120s for Grok, 300s for Antigravity)
+- `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override
+- `PEER_AGENTS_JOB_TIMEOUT_MS` — async job timeout (default 30 minutes)
+- `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional async per-provider overrides
 - `PEER_AGENTS_MAX_PROMPT_CHARS` — safety limit on prompt size
 
 ## Multi-turn peer sessions
@@ -116,12 +146,28 @@ Each routed call returns a `sessionId`. Use `peer_turn` to continue the conversa
 
 Sessions are persisted to disk, so they survive across restarts of the MCP server.
 
+## Grok CLI integration (0.2.x+)
+
+Grok peer turns use modern headless flags under the hood (callers do not pass these):
+
+| Concern | Behavior |
+|---------|----------|
+| Large prompts | Always `--prompt-file` (avoids argv limits) |
+| Multi-turn | `--resume <nativeSessionId>` when available; falls back to MCP transcript rehydrate |
+| Reviewer / planner / critic | `--sandbox read-only`, deny edit tools, no web search |
+| Implementer | `--sandbox workspace`, `--always-approve` |
+| `peer_implement_async` | Default git `--worktree` isolation (`use_worktree: false` to opt out) |
+| Review findings | `--json-schema` structured findings when useful; also returned as `structured` |
+| Risk / security | Elevated `--effort` and optional `--check` self-verify |
+| Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
+
 ## Design notes
 
 - The server never modifies your repo itself — it only runs the CLIs you already have.
 - User messages in session transcripts are labeled from the caller's perspective (commonly "Codex").
 - Idempotency keys are supported so repeated calls with the same key are safe.
 - Context quality hints are returned when the input looks too thin (missing files, diffs, etc.).
+- Implementation handoffs default to a Grok worktree so the peer does not clobber a dirty main tree.
 
 ## License
 

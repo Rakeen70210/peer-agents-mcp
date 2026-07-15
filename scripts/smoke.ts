@@ -48,6 +48,33 @@ async function main() {
   });
   console.log("turn:", JSON.stringify(turn, null, 2));
 
+  const asyncJob = await callTool(client, "peer_implement_async", {
+    task: "smoke async implement",
+    repo_path: process.cwd(),
+    message: "Reply with exactly: smoke-async-ok",
+    idempotency_key: `smoke-async-${Date.now()}`,
+  });
+  console.log("async start:", JSON.stringify(asyncJob, null, 2));
+
+  let final = asyncJob;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    final = await callTool(client, "peer_job_status", { job_id: asyncJob.jobId });
+    if (
+      final.status === "succeeded" ||
+      final.status === "failed" ||
+      final.status === "timed_out" ||
+      final.status === "cancelled" ||
+      final.status === "orphaned"
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  console.log("async final:", JSON.stringify(final, null, 2));
+  if (final.status !== "succeeded") {
+    throw new Error(`async job did not succeed: ${final.status}`);
+  }
+
   await client.close();
 }
 

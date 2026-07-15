@@ -5,6 +5,7 @@ export type SpawnResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  aborted: boolean;
 };
 
 export async function runCommand(options: {
@@ -14,23 +15,91 @@ export async function runCommand(options: {
   stdin?: string;
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 }): Promise<SpawnResult> {
+  if (options.signal?.aborted) {
+    return {
+      exitCode: null,
+      stdout: "",
+      stderr: "Aborted before start",
+      timedOut: false,
+      aborted: true,
+    };
+  }
+
   return new Promise((resolve) => {
+    const useProcessGroup = process.platform !== "win32";
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env, NO_COLOR: "1" },
       stdio: ["pipe", "pipe", "pipe"],
+      // Own process group so timeout/cancel can kill grandchildren without
+      // signalling the MCP server process group.
+      detached: useProcessGroup,
     });
 
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+    let settled = false;
+
+    const finish = (result: SpawnResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+
+    const killChild = () => {
+      if (!child.pid) {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already dead
+        }
+        return;
+      }
+      try {
+        if (useProcessGroup) {
+          process.kill(-child.pid, "SIGTERM");
+          setTimeout(() => {
+            try {
+              process.kill(-child.pid!, "SIGKILL");
+            } catch {
+              // already dead
+            }
+          }, 2000).unref();
+        } else {
+          child.kill("SIGTERM");
+          setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // already dead
+            }
+          }, 2000).unref();
+        }
+      } catch {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already dead
+        }
+      }
+    };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      killChild();
     }, options.timeoutMs);
+
+    const onAbort = () => {
+      aborted = true;
+      killChild();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
@@ -40,17 +109,16 @@ export async function runCommand(options: {
     });
 
     child.on("close", (exitCode) => {
-      clearTimeout(timer);
-      resolve({ exitCode, stdout, stderr, timedOut });
+      finish({ exitCode, stdout, stderr, timedOut, aborted });
     });
 
     child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({
+      finish({
         exitCode: 1,
         stdout,
         stderr: `${stderr}\n${error.message}`.trim(),
         timedOut,
+        aborted,
       });
     });
 

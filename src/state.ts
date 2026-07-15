@@ -33,6 +33,8 @@ export type StoredSession = {
   messages: ChatMessage[];
   version: number;
   nativeSessionId?: string;
+  /** Grok worktree name for implementer isolation (set once at session create). */
+  worktreeName?: string;
   createdAt: string;
   updatedAt: string;
   operations: StoredOperation[];
@@ -169,6 +171,7 @@ export function createSession(input: {
   repoPath: string;
   mode: PeerMode;
   system?: string;
+  worktreeName?: string;
 }): Session {
   const now = nowIso();
   return {
@@ -180,6 +183,7 @@ export function createSession(input: {
     repoPath: input.repoPath,
     mode: input.mode,
     system: input.system,
+    worktreeName: input.worktreeName,
     summary: "",
     messages: [],
     version: 0,

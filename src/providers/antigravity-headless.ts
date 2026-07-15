@@ -56,6 +56,7 @@ export class AntigravityHeadlessProvider implements PeerProvider {
   async runTurn(input: PeerRunInput): Promise<PeerRunResult> {
     let cleanup: AttachmentCleanup | undefined;
     let prompt = input.constructedPrompt;
+    const timeoutMs = input.timeoutMs ?? this.timeoutMs;
 
     try {
       if (input.files?.length && input.cwd) {
@@ -71,7 +72,7 @@ export class AntigravityHeadlessProvider implements PeerProvider {
       const args = [
         ...stripModelArgs(this.baseArgs),
         "--print-timeout",
-        formatGoDuration(this.timeoutMs),
+        formatGoDuration(timeoutMs),
         "-p",
         prompt,
         "--dangerously-skip-permissions",
@@ -87,15 +88,27 @@ export class AntigravityHeadlessProvider implements PeerProvider {
         command: this.command,
         args,
         cwd: input.cwd,
-        timeoutMs: this.timeoutMs,
+        timeoutMs,
+        signal: input.signal,
       });
+
+      if (result.aborted || input.signal?.aborted) {
+        return {
+          isError: true,
+          text: "",
+          stdout: result.stdout,
+          stderr: "Antigravity cancelled",
+          cancelled: true,
+        };
+      }
 
       if (result.timedOut) {
         return {
           isError: true,
           text: "",
           stdout: result.stdout,
-          stderr: `Antigravity timed out after ${this.timeoutMs}ms`,
+          stderr: `Antigravity timed out after ${timeoutMs}ms`,
+          timedOut: true,
         };
       }
 

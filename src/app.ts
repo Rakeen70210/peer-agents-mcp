@@ -8,6 +8,18 @@ import {
   type ContextQualityInput,
 } from "./context-quality.js";
 import {
+  createStoredJob,
+  formatJobStatus,
+  isTerminalJobStatus,
+  jobIdFrom,
+  jobsDirFor,
+  loadAllJobsFromDir,
+  loadJobFromDir,
+  saveJobToDir,
+  type JobStatusResponse,
+  type StoredJob,
+} from "./jobs.js";
+import {
   buildTaskPrompt,
   askMessage,
   debateMessage,
@@ -18,8 +30,17 @@ import {
   verifyMessage,
 } from "./prompts.js";
 import { AntigravityHeadlessProvider } from "./providers/antigravity-headless.js";
-import { GrokHeadlessProvider } from "./providers/grok-headless.js";
-import type { PeerProvider, PeerProviderName, PeerRunResult } from "./providers/types.js";
+import {
+  GrokHeadlessProvider,
+  isLikelyResumeFailure,
+  sanitizeWorktreeName,
+} from "./providers/grok-headless.js";
+import type {
+  PeerProvider,
+  PeerProviderName,
+  PeerRunMetrics,
+  PeerRunResult,
+} from "./providers/types.js";
 import { parsePositiveInt } from "./providers/runner.js";
 import {
   estimateContextTokens,
@@ -49,6 +70,7 @@ import {
 export type AppOptions = {
   storageDir?: string;
   comparisonsDir?: string;
+  jobsDir?: string;
   providers?: Partial<Record<PeerProviderName, PeerProvider>>;
   maxPromptChars?: number;
   recentTurnCount?: number;
@@ -67,6 +89,29 @@ type TurnResult = {
   stateSummary: string;
   nativeSessionId?: string;
   isError?: boolean;
+  timedOut?: boolean;
+  cancelled?: boolean;
+  resumed?: boolean;
+  metrics?: PeerRunMetrics;
+  structured?: unknown;
+  worktreeName?: string;
+};
+
+type PeerTurnOptions = {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  riskLevel?: RiskLevel;
+  complexity?: "simple" | "complex";
+  focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+  /** Override structured output (default from provider profile). */
+  structuredOutput?: boolean;
+  selfVerify?: boolean;
+};
+
+type LiveJob = {
+  stored: StoredJob;
+  abortController: AbortController;
+  promise: Promise<void>;
 };
 
 export type CompareProviderResult = {
@@ -99,6 +144,10 @@ export type RoutedPeerResult = {
   stateSummary: string;
   nativeSessionId?: string;
   isError: boolean;
+  resumed?: boolean;
+  metrics?: PeerRunMetrics;
+  structured?: unknown;
+  worktreeName?: string;
 };
 
 export type RoutedTaskResult = {
@@ -124,10 +173,26 @@ const MODE_INSTRUCTIONS: Record<string, string> = {
     "You may edit files, run commands, and implement changes directly when helpful.",
 };
 
+const DEFAULT_JOB_TIMEOUT_MS = 1_800_000;
+
+export function jobTimeoutMsFor(provider: PeerProviderName): number {
+  if (provider === "grok") {
+    return parsePositiveInt(
+      process.env.GROK_JOB_TIMEOUT_MS ?? process.env.PEER_AGENTS_JOB_TIMEOUT_MS,
+      DEFAULT_JOB_TIMEOUT_MS,
+    );
+  }
+  return parsePositiveInt(
+    process.env.ANTIGRAVITY_JOB_TIMEOUT_MS ?? process.env.PEER_AGENTS_JOB_TIMEOUT_MS,
+    DEFAULT_JOB_TIMEOUT_MS,
+  );
+}
+
 export function createApp(options: AppOptions = {}) {
   const storageDir = options.storageDir ?? defaultStorageDir();
   const comparisonsDir =
     options.comparisonsDir ?? comparisonsDirFor(storageDir);
+  const jobsDir = options.jobsDir ?? jobsDirFor(storageDir);
   const maxPromptChars =
     options.maxPromptChars ??
     parsePositiveInt(process.env.PEER_AGENTS_MAX_PROMPT_CHARS, 120_000);
@@ -140,12 +205,95 @@ export function createApp(options: AppOptions = {}) {
   };
 
   const sessions = new Map<string, Session>();
+  const liveJobs = new Map<string, LiveJob>();
 
+  async function persistJob(job: StoredJob): Promise<void> {
+    await saveJobToDir(jobsDir, job);
+  }
+
+  /**
+   * Transition a job only if it is still non-terminal (or already at the
+   * requested terminal status). Prevents cancel/timeout/success races from
+   * overwriting a sticky terminal state.
+   */
+  async function transitionJob(
+    job: StoredJob,
+    next: {
+      status: StoredJob["status"];
+      result?: unknown;
+      error?: string;
+      startedAt?: string;
+    },
+  ): Promise<boolean> {
+    if (isTerminalJobStatus(job.status) && job.status !== next.status) {
+      return false;
+    }
+    const now = new Date().toISOString();
+    job.status = next.status;
+    job.updatedAt = now;
+    if (next.startedAt) job.startedAt = next.startedAt;
+    if (next.result !== undefined) job.result = next.result;
+    if (next.error !== undefined) job.error = next.error;
+    if (isTerminalJobStatus(next.status)) {
+      job.finishedAt = job.finishedAt ?? now;
+    }
+    await persistJob(job);
+    return true;
+  }
+
+
+  function isJobCancelled(job: StoredJob, signal: AbortSignal): boolean {
+    return signal.aborted || job.status === "cancelled";
+  }
+
+  async function reconcileJobs(): Promise<void> {
+    const allJobs = await loadAllJobsFromDir(jobsDir);
+    for (const job of allJobs) {
+      if (job.status !== "queued" && job.status !== "running") continue;
+      if (liveJobs.has(job.id)) continue;
+
+      let session =
+        sessions.get(job.sessionId) ??
+        (await loadSessionFromDir(storageDir, job.sessionId));
+      if (session && !sessions.has(session.id)) {
+        sessions.set(session.id, session);
+      }
+      if (session) {
+        const committed = getCommittedOperationResult<TurnResult>(
+          session,
+          job.idempotencyKey,
+        );
+        if (committed !== undefined) {
+          job.status = "succeeded";
+          job.result = committed;
+          job.updatedAt = new Date().toISOString();
+          job.finishedAt = job.finishedAt ?? job.updatedAt;
+          job.error = undefined;
+          await persistJob(job);
+          continue;
+        }
+      }
+
+      job.status = "orphaned";
+      job.error =
+        "Job was interrupted by MCP server restart; live provider work was not recovered";
+      job.updatedAt = new Date().toISOString();
+      job.finishedAt = job.finishedAt ?? job.updatedAt;
+      await persistJob(job);
+    }
+  }
+
+  /**
+   * Hydrate missing sessions from disk without replacing live in-memory
+   * sessions (which would drop active chains / job coordination).
+   */
   async function hydrate(): Promise<void> {
     const loaded = await loadAllSessionsFromDir(storageDir);
     for (const session of loaded) {
+      if (sessions.has(session.id)) continue;
       sessions.set(session.id, session);
     }
+    await reconcileJobs();
   }
 
   async function persist(session: Session): Promise<void> {
@@ -194,15 +342,44 @@ export function createApp(options: AppOptions = {}) {
     return `${label}: ${message.content.trim()}`;
   }
 
-  function buildPrompt(session: Session, input: {
-    message: string;
-    diff?: string;
-    files?: Array<{ path: string; content: string }>;
-  }): string {
+  function buildPrompt(
+    session: Session,
+    input: {
+      message: string;
+      diff?: string;
+      files?: Array<{ path: string; content: string }>;
+    },
+    options?: { nativeResume?: boolean },
+  ): string {
+    // Native CLI resume already holds role, history, and prior attachments.
+    // Send only the new user request + fresh artifacts.
+    if (options?.nativeResume) {
+      const lines = [
+        "Continue the peer session.",
+        "Current request:",
+        input.message.trim(),
+      ];
+      if (input.diff?.trim()) {
+        lines.push("", "Diff:", input.diff.trim());
+      }
+      if (input.files?.length) {
+        const { textFiles } = classifyAttachments(input.files);
+        if (textFiles.length > 0) {
+          lines.push("", "Files:");
+          for (const file of textFiles) {
+            lines.push(`--- ${file.path} ---`, file.content.trim(), "");
+          }
+        }
+      }
+      return redactSecrets(lines.join("\n"));
+    }
+
     const lines = [
       `You are ${session.routedProvider ?? session.provider} acting as a peer agent (CLI default model).`,
       MODE_INSTRUCTIONS[session.mode] ?? MODE_INSTRUCTIONS.reviewer,
-      "You may edit files and run commands in the repo when that helps complete the task.",
+      session.mode === "implementer"
+        ? "You may edit files and run commands in the repo when that helps complete the task."
+        : "Prefer analysis over edits. Do not modify project files unless explicitly required.",
       "",
       `Task: ${session.task}`,
     ];
@@ -291,33 +468,136 @@ export function createApp(options: AppOptions = {}) {
       .slice(0, 4000);
   }
 
-  async function runPeerTurn(
+  function toTurnResult(
     session: Session,
-    prompt: string,
-    userMessageForTranscript: string,
-    files?: Array<{ path: string; content: string }>,
-  ): Promise<TurnResult> {
+    peerResult: PeerRunResult,
+    flags?: { isError?: boolean; timedOut?: boolean; cancelled?: boolean },
+  ): TurnResult {
+    return {
+      sessionId: session.id,
+      version: session.version,
+      response:
+        flags?.cancelled || flags?.timedOut || flags?.isError
+          ? peerResult.stderr || peerResult.text || "Error"
+          : peerResult.text,
+      stateSummary: stateSummary(session),
+      nativeSessionId:
+        peerResult.nativeSessionId ?? session.nativeSessionId ?? undefined,
+      isError: flags?.isError ?? peerResult.isError ?? false,
+      timedOut: flags?.timedOut,
+      cancelled: flags?.cancelled,
+      resumed: peerResult.resumed,
+      metrics: peerResult.metrics,
+      structured: peerResult.structured,
+      worktreeName: peerResult.worktreeName ?? session.worktreeName,
+    };
+  }
+
+  async function invokeProvider(
+    session: Session,
+    constructedPrompt: string,
+    files: Array<{ path: string; content: string }> | undefined,
+    runOptions: PeerTurnOptions | undefined,
+    nativeSessionId: string | undefined,
+  ): Promise<PeerRunResult> {
     const provider = getProvider(session.provider);
-    const constructedPrompt = enforcePromptLimit(prompt);
-    const peerResult = await provider.runTurn({
+    return provider.runTurn({
       constructedPrompt,
       cwd: session.repoPath,
       mode: session.mode,
       files,
+      timeoutMs: runOptions?.timeoutMs,
+      signal: runOptions?.signal,
+      nativeSessionId,
+      riskLevel: runOptions?.riskLevel,
+      complexity: runOptions?.complexity,
+      focus: runOptions?.focus,
+      worktree:
+        !nativeSessionId && session.worktreeName
+          ? session.worktreeName
+          : undefined,
+      structuredOutput: runOptions?.structuredOutput,
+      selfVerify: runOptions?.selfVerify,
     });
+  }
 
+  async function runPeerTurn(
+    session: Session,
+    input: {
+      message: string;
+      diff?: string;
+      files?: Array<{ path: string; content: string }>;
+    },
+    userMessageForTranscript: string,
+    runOptions?: PeerTurnOptions,
+  ): Promise<TurnResult> {
+    // Only Grok headless supports native --resume today.
+    const canResume =
+      session.provider === "grok" && Boolean(session.nativeSessionId);
+
+    if (canResume) {
+      const compact = enforcePromptLimit(
+        buildPrompt(session, input, { nativeResume: true }),
+      );
+      const resumed = await invokeProvider(
+        session,
+        compact,
+        input.files,
+        runOptions,
+        session.nativeSessionId,
+      );
+
+      if (resumed.cancelled || runOptions?.signal?.aborted) {
+        return toTurnResult(session, resumed, {
+          isError: true,
+          cancelled: true,
+        });
+      }
+      if (resumed.timedOut) {
+        return toTurnResult(session, resumed, { isError: true, timedOut: true });
+      }
+      if (!resumed.isError) {
+        await recordTurn(session, userMessageForTranscript, resumed);
+        return toTurnResult(session, resumed);
+      }
+      if (!isLikelyResumeFailure(resumed)) {
+        return toTurnResult(session, resumed, { isError: true });
+      }
+      // Native session lost — fall back to MCP transcript rehydrate.
+      session.nativeSessionId = undefined;
+    }
+
+    const full = enforcePromptLimit(buildPrompt(session, input));
+    const peerResult = await invokeProvider(
+      session,
+      full,
+      input.files,
+      runOptions,
+      undefined,
+    );
+
+    if (peerResult.cancelled || runOptions?.signal?.aborted) {
+      return toTurnResult(session, peerResult, {
+        isError: true,
+        cancelled: true,
+      });
+    }
+    if (peerResult.timedOut) {
+      return toTurnResult(session, peerResult, {
+        isError: true,
+        timedOut: true,
+      });
+    }
     if (!peerResult.isError) {
+      if (peerResult.worktreeName && !session.worktreeName) {
+        session.worktreeName = peerResult.worktreeName;
+      }
       await recordTurn(session, userMessageForTranscript, peerResult);
     }
 
-    return {
-      sessionId: session.id,
-      version: session.version,
-      response: peerResult.text,
-      stateSummary: stateSummary(session),
-      nativeSessionId: peerResult.nativeSessionId ?? session.nativeSessionId ?? undefined,
-      isError: peerResult.isError ?? false,
-    };
+    return toTurnResult(session, peerResult, {
+      isError: peerResult.isError ? true : undefined,
+    });
   }
 
   function enforcePromptLimit(prompt: string): string {
@@ -326,7 +606,199 @@ export function createApp(options: AppOptions = {}) {
     return prompt.slice(0, maxPromptChars - marker.length) + marker;
   }
 
-  return {
+  function syntheticSucceededJob(
+    session: Session,
+    idempotencyKey: string,
+    result: TurnResult,
+  ): JobStatusResponse {
+    const now = new Date().toISOString();
+    return formatJobStatus({
+      id: jobIdFrom(session.id, idempotencyKey),
+      sessionId: session.id,
+      idempotencyKey,
+      provider: session.provider,
+      status: "succeeded",
+      task: session.task,
+      createdAt: now,
+      updatedAt: now,
+      finishedAt: now,
+      timeoutMs: jobTimeoutMsFor(session.provider),
+      result,
+    });
+  }
+
+  async function resolveJob(jobId: string): Promise<StoredJob> {
+    const live = liveJobs.get(jobId);
+    if (live) return live.stored;
+
+    const loaded = await loadJobFromDir(jobsDir, jobId);
+    if (!loaded) {
+      throw new Error(`Unknown job: ${jobId}`);
+    }
+
+    // Crash-window recovery: committed session op is source of truth.
+    if (loaded.status === "queued" || loaded.status === "running") {
+      const session =
+        sessions.get(loaded.sessionId) ??
+        (await loadSessionFromDir(storageDir, loaded.sessionId));
+      if (session) {
+        if (!sessions.has(session.id)) sessions.set(session.id, session);
+        const committed = getCommittedOperationResult<TurnResult>(
+          session,
+          loaded.idempotencyKey,
+        );
+        if (committed !== undefined) {
+          loaded.status = "succeeded";
+          loaded.result = committed;
+          loaded.updatedAt = new Date().toISOString();
+          loaded.finishedAt = loaded.finishedAt ?? loaded.updatedAt;
+          loaded.error = undefined;
+          await persistJob(loaded);
+        }
+      }
+    }
+
+    return loaded;
+  }
+
+  function scheduleTurnJob(input: {
+    session: Session;
+    job: StoredJob;
+    message: string;
+    diff?: string;
+    files?: Array<{ path: string; content: string }>;
+    expectedVersion?: number;
+  }): LiveJob {
+    const { session, job } = input;
+    const abortController = new AbortController();
+
+    const promise = (async () => {
+      try {
+        await enqueue(session, async () => {
+          if (isTerminalJobStatus(job.status) || abortController.signal.aborted) {
+            if (!isTerminalJobStatus(job.status)) {
+              await transitionJob(job, {
+                status: "cancelled",
+                error: "Cancelled by caller",
+              });
+            }
+            return;
+          }
+
+          const replay = getCommittedOperationResult<TurnResult>(
+            session,
+            job.idempotencyKey,
+          );
+          if (replay !== undefined) {
+            await transitionJob(job, { status: "succeeded", result: replay });
+            return;
+          }
+
+          try {
+            assertExpectedVersion(session, input.expectedVersion);
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            await transitionJob(job, { status: "failed", error: message });
+            return;
+          }
+
+          if (abortController.signal.aborted) {
+            await transitionJob(job, {
+              status: "cancelled",
+              error: "Cancelled by caller",
+            });
+            return;
+          }
+
+          const startedAt = new Date().toISOString();
+          await transitionJob(job, { status: "running", startedAt });
+
+          try {
+            const result = await runPeerTurn(
+              session,
+              {
+                message: input.message,
+                diff: input.diff,
+                files: input.files,
+              },
+              input.message,
+              {
+                timeoutMs: job.timeoutMs,
+                signal: abortController.signal,
+              },
+            );
+
+            if (result.cancelled || isJobCancelled(job, abortController.signal)) {
+              await transitionJob(job, {
+                status: "cancelled",
+                error: result.response || "Cancelled by caller",
+              });
+              return;
+            }
+
+            if (result.timedOut) {
+              await transitionJob(job, {
+                status: "timed_out",
+                error: result.response || `Timed out after ${job.timeoutMs}ms`,
+              });
+              return;
+            }
+
+            if (result.isError) {
+              await transitionJob(job, {
+                status: "failed",
+                error: result.response || "Provider returned an error",
+              });
+              return;
+            }
+
+            // Re-check cancellation after provider success before commit.
+            if (isJobCancelled(job, abortController.signal)) {
+              await transitionJob(job, {
+                status: "cancelled",
+                error: "Cancelled by caller",
+              });
+              return;
+            }
+
+            commitOperation(session, job.idempotencyKey, result);
+            await persist(session);
+            await transitionJob(job, { status: "succeeded", result });
+          } catch (error) {
+            if (isJobCancelled(job, abortController.signal)) {
+              await transitionJob(job, {
+                status: "cancelled",
+                error: "Cancelled by caller",
+              });
+              return;
+            }
+            const message =
+              error instanceof Error ? error.message : String(error);
+            await transitionJob(job, { status: "failed", error: message });
+          }
+        });
+      } catch (error) {
+        if (!isTerminalJobStatus(job.status)) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          await transitionJob(job, { status: "failed", error: message });
+        }
+      } finally {
+        // Keep terminal job on disk; drop only the live handle.
+        liveJobs.delete(job.id);
+      }
+    })();
+
+    // Ensure unhandled rejections never crash the MCP process.
+    promise.catch(() => undefined);
+
+    const live: LiveJob = { stored: job, abortController, promise };
+    liveJobs.set(job.id, live);
+    return live;
+  }
+
+  const app = {
     hydrate,
     async health() {
       const results = await Promise.all(
@@ -347,6 +819,7 @@ export function createApp(options: AppOptions = {}) {
       mode?: Session["mode"];
       system?: string;
       sessionId?: string;
+      worktreeName?: string;
     }) {
       await hydrate();
       const id =
@@ -360,11 +833,16 @@ export function createApp(options: AppOptions = {}) {
 
       const existing = sessions.get(id) ?? (await loadSessionFromDir(storageDir, id));
       if (existing) {
-        sessions.set(id, existing);
+        // Prefer the live in-memory session so we do not replace an active chain.
+        if (!sessions.has(id)) {
+          sessions.set(id, existing);
+        }
+        const live = sessions.get(id)!;
         return {
           sessionId: id,
           resumed: true,
-          stateSummary: stateSummary(existing),
+          stateSummary: stateSummary(live),
+          worktreeName: live.worktreeName,
         };
       }
 
@@ -377,6 +855,7 @@ export function createApp(options: AppOptions = {}) {
         repoPath: input.repoPath,
         mode: input.mode ?? "implementer",
         system: input.system,
+        worktreeName: input.worktreeName,
       });
       sessions.set(id, session);
       await persist(session);
@@ -384,6 +863,7 @@ export function createApp(options: AppOptions = {}) {
         sessionId: id,
         resumed: false,
         stateSummary: stateSummary(session),
+        worktreeName: session.worktreeName,
       };
     },
 
@@ -454,7 +934,7 @@ export function createApp(options: AppOptions = {}) {
 
       const runRoute = async (route: RoutedProvider): Promise<RoutedPeerResult> => {
         const spec = resolveRouteSpec(route);
-        const started = await this.start({
+        const started = await app.start({
           provider: spec.cli,
           routedProvider: route,
           task: input.task,
@@ -463,16 +943,22 @@ export function createApp(options: AppOptions = {}) {
         });
         const session = getSession(started.sessionId);
         return enqueue(session, async () => {
-          const prompt = buildPrompt(session, {
-            message: promptMessage,
-            diff: input.diff,
-            files: input.files,
-          });
+          const mode = input.mode ?? modeForKind(input.kind);
           const result = await runPeerTurn(
             session,
-            prompt,
+            {
+              message: promptMessage,
+              diff: input.diff,
+              files: input.files,
+            },
             input.message,
-            input.files,
+            {
+              riskLevel: input.risk,
+              complexity: input.complexity,
+              focus: input.focus,
+              structuredOutput:
+                mode === "planner" || mode === "implementer" ? false : undefined,
+            },
           );
           return {
             routedProvider: route,
@@ -484,6 +970,10 @@ export function createApp(options: AppOptions = {}) {
             stateSummary: result.stateSummary,
             nativeSessionId: result.nativeSessionId,
             isError: result.isError ?? false,
+            resumed: result.resumed,
+            metrics: result.metrics,
+            structured: result.structured,
+            worktreeName: result.worktreeName,
           };
         });
       };
@@ -545,7 +1035,7 @@ export function createApp(options: AppOptions = {}) {
           : focus === "architecture"
             ? "architecture"
             : "review_diff";
-      return this.executeRouted({
+      return app.executeRouted({
         kind,
         task: input.task ?? `review-diff:${focus}`,
         repoPath: input.repoPath,
@@ -570,7 +1060,7 @@ export function createApp(options: AppOptions = {}) {
       files?: Array<{ path: string; content: string }>;
       idempotencyKey: string;
     }) {
-      return this.executeRouted({
+      return app.executeRouted({
         kind: "plan",
         task: input.task,
         repoPath: input.repoPath,
@@ -599,7 +1089,7 @@ export function createApp(options: AppOptions = {}) {
       task?: string;
       idempotencyKey: string;
     }) {
-      return this.executeRouted({
+      return app.executeRouted({
         kind: "debug",
         task: input.task ?? "debug-failure",
         repoPath: input.repoPath,
@@ -626,7 +1116,7 @@ export function createApp(options: AppOptions = {}) {
       riskLevel?: RiskLevel;
       idempotencyKey: string;
     }) {
-      return this.executeRouted({
+      return app.executeRouted({
         kind: "verify",
         task: input.task ?? "verify-change",
         repoPath: input.repoPath,
@@ -648,7 +1138,7 @@ export function createApp(options: AppOptions = {}) {
       riskLevel?: RiskLevel;
       idempotencyKey: string;
     }) {
-      return this.executeRouted({
+      return app.executeRouted({
         kind: "debate",
         task: input.task,
         repoPath: input.repoPath,
@@ -673,7 +1163,7 @@ export function createApp(options: AppOptions = {}) {
       task?: string;
       idempotencyKey: string;
     }) {
-      return this.executeRouted({
+      return app.executeRouted({
         kind: "general_knowledge",
         task: input.task ?? "general-question",
         repoPath: input.repoPath,
@@ -704,17 +1194,165 @@ export function createApp(options: AppOptions = {}) {
         if (replay) return replay;
 
         assertExpectedVersion(session, input.expectedVersion);
-        const prompt = buildPrompt(session, input);
         const result = await runPeerTurn(
           session,
-          prompt,
+          {
+            message: input.message,
+            diff: input.diff,
+            files: input.files,
+          },
           input.message,
-          input.files,
         );
         commitOperation(session, input.idempotencyKey, result);
         await persist(session);
         return result;
       });
+    },
+
+    /**
+     * Start a background turn for an existing session. Returns immediately
+     * with job metadata; poll getJobStatus for completion.
+     */
+    async turnAsync(input: MutateInput & {
+      message: string;
+      diff?: string;
+      files?: Array<{ path: string; content: string }>;
+    }): Promise<JobStatusResponse> {
+      await hydrate();
+      const session = getSession(input.sessionId);
+      const jobId = jobIdFrom(session.id, input.idempotencyKey);
+
+      const committed = getCommittedOperationResult<TurnResult>(
+        session,
+        input.idempotencyKey,
+      );
+      if (committed !== undefined) {
+        return syntheticSucceededJob(session, input.idempotencyKey, committed);
+      }
+
+      const live = liveJobs.get(jobId);
+      if (live) {
+        return formatJobStatus(live.stored);
+      }
+
+      const persisted = await loadJobFromDir(jobsDir, jobId);
+      if (persisted) {
+        // Sticky terminal / orphaned jobs: never re-run same key.
+        if (isTerminalJobStatus(persisted.status)) {
+          // Recover succeeded from committed op if present.
+          if (
+            persisted.status !== "succeeded" &&
+            (persisted.status === "queued" ||
+              persisted.status === "running" ||
+              persisted.status === "orphaned")
+          ) {
+            // no-op: terminal non-succeeded stays sticky
+          }
+          const committedAgain = getCommittedOperationResult<TurnResult>(
+            session,
+            input.idempotencyKey,
+          );
+          if (committedAgain !== undefined && persisted.status !== "succeeded") {
+            // Crash window: session committed but job file not updated.
+            await transitionJob(persisted, {
+              status: "succeeded",
+              result: committedAgain,
+            });
+          }
+          return formatJobStatus(persisted);
+        }
+        // Non-terminal without live entry should have been orphaned on hydrate.
+        // Still sticky: do not start a duplicate provider.
+        return formatJobStatus(persisted);
+      }
+
+      const job = createStoredJob({
+        id: jobId,
+        sessionId: session.id,
+        idempotencyKey: input.idempotencyKey,
+        provider: session.provider,
+        task: session.task,
+        timeoutMs: jobTimeoutMsFor(session.provider),
+        status: "queued",
+      });
+      await persistJob(job);
+      scheduleTurnJob({
+        session,
+        job,
+        message: input.message,
+        diff: input.diff,
+        files: input.files,
+        expectedVersion: input.expectedVersion,
+      });
+      return formatJobStatus(job);
+    },
+
+    /**
+     * Cold-start large implementation handoff: create an implementer Grok
+     * session and enqueue the first background turn in one call.
+     */
+    async implementAsync(input: {
+      task: string;
+      repoPath: string;
+      message: string;
+      idempotencyKey: string;
+      diff?: string;
+      files?: Array<{ path: string; content: string }>;
+      system?: string;
+      /** Opt out of git worktree isolation (default: isolated worktree). */
+      useWorktree?: boolean;
+    }): Promise<JobStatusResponse> {
+      const useWorktree = input.useWorktree !== false;
+      const worktreeName = useWorktree
+        ? sanitizeWorktreeName(
+            `peer-impl-${makeSessionId({
+              repoPath: input.repoPath,
+              provider: "grok",
+              task: input.task,
+            }).slice(0, 12)}`,
+          )
+        : undefined;
+      const started = await app.start({
+        provider: "grok",
+        task: input.task,
+        repoPath: input.repoPath,
+        mode: "implementer",
+        system: input.system,
+        worktreeName,
+      });
+      return app.turnAsync({
+        sessionId: started.sessionId,
+        message: input.message,
+        idempotencyKey: input.idempotencyKey,
+        diff: input.diff,
+        files: input.files,
+      });
+    },
+
+    async getJobStatus(input: { jobId: string }): Promise<JobStatusResponse> {
+      await hydrate();
+      const job = await resolveJob(input.jobId);
+      return formatJobStatus(job);
+    },
+
+    async cancelJob(input: { jobId: string }): Promise<JobStatusResponse> {
+      await hydrate();
+      const live = liveJobs.get(input.jobId);
+      const job = live?.stored ?? (await loadJobFromDir(jobsDir, input.jobId));
+      if (!job) {
+        throw new Error(`Unknown job: ${input.jobId}`);
+      }
+
+      if (isTerminalJobStatus(job.status)) {
+        return formatJobStatus(job);
+      }
+
+      live?.abortController.abort();
+      await transitionJob(job, {
+        status: "cancelled",
+        error: "Cancelled by caller",
+      });
+      return formatJobStatus(job);
     },
 
     async compare(input: {
@@ -751,7 +1389,7 @@ export function createApp(options: AppOptions = {}) {
       const runForProvider = async (
         provider: PeerProviderName,
       ): Promise<CompareProviderResult> => {
-        const started = await this.start({
+        const started = await app.start({
           provider,
           task: input.task,
           repoPath: input.repoPath,
@@ -761,12 +1399,10 @@ export function createApp(options: AppOptions = {}) {
         const session = getSession(started.sessionId);
 
         return enqueue(session, async () => {
-          const prompt = buildPrompt(session, turnInput);
           const result = await runPeerTurn(
             session,
-            prompt,
+            turnInput,
             input.message,
-            input.files,
           );
           return {
             provider,
@@ -889,6 +1525,8 @@ export function createApp(options: AppOptions = {}) {
       });
     },
   };
+
+  return app;
 }
 
 const SECRET_PATTERNS = [

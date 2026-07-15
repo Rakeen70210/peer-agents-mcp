@@ -1,0 +1,105 @@
+import type { PeerComplexity, PeerFocus, PeerMode, PeerRiskLevel } from "./types.js";
+
+export type GrokCapabilityProfile = {
+  /** CLI args after prompt-file / resume / output-format. */
+  args: string[];
+  /** Whether always-approve / bypass permissions is enabled. */
+  alwaysApprove: boolean;
+  maxTurns: number;
+  /** Prefer structured JSON findings. */
+  preferStructuredOutput: boolean;
+};
+
+/**
+ * Map peer mode to Grok headless safety / tool constraints.
+ * Review-like modes stay read-only; implementer gets autonomy.
+ */
+export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile {
+  switch (mode) {
+    case "implementer":
+      return {
+        alwaysApprove: true,
+        maxTurns: 80,
+        preferStructuredOutput: false,
+        args: [
+          "--sandbox",
+          "workspace",
+          "--max-turns",
+          "80",
+          "--always-approve",
+        ],
+      };
+    case "planner":
+      return {
+        alwaysApprove: false,
+        maxTurns: 30,
+        preferStructuredOutput: false,
+        args: [
+          "--sandbox",
+          "read-only",
+          "--max-turns",
+          "30",
+          "--disallowed-tools",
+          "search_replace,write",
+          "--disable-web-search",
+          // Headless prompts that need tools cancel rather than hang;
+          // deny-by-default would block useful read shell — use sandbox instead.
+          "--permission-mode",
+          "default",
+        ],
+      };
+    case "critic":
+    case "reviewer":
+    default:
+      return {
+        alwaysApprove: false,
+        maxTurns: 25,
+        preferStructuredOutput: true,
+        args: [
+          "--sandbox",
+          "read-only",
+          "--max-turns",
+          "25",
+          "--disallowed-tools",
+          "search_replace,write",
+          "--disable-web-search",
+          "--permission-mode",
+          "default",
+        ],
+      };
+  }
+}
+
+/**
+ * Map risk / complexity / focus to Grok `--effort` when elevated.
+ * Returns undefined to leave CLI default.
+ */
+export function effortForRisk(input: {
+  riskLevel?: PeerRiskLevel;
+  complexity?: PeerComplexity;
+  focus?: PeerFocus;
+  mode: PeerMode;
+}): string | undefined {
+  if (input.focus === "security" || input.riskLevel === "high") {
+    return "high";
+  }
+  if (input.complexity === "complex" || input.mode === "implementer") {
+    return "medium";
+  }
+  if (input.riskLevel === "medium") {
+    return "medium";
+  }
+  return undefined;
+}
+
+export function shouldSelfVerify(input: {
+  riskLevel?: PeerRiskLevel;
+  focus?: PeerFocus;
+  mode: PeerMode;
+  selfVerify?: boolean;
+}): boolean {
+  if (input.selfVerify === true) return true;
+  if (input.selfVerify === false) return false;
+  if (input.mode !== "reviewer" && input.mode !== "critic") return false;
+  return input.riskLevel === "high" || input.focus === "security";
+}

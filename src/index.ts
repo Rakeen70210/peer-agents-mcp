@@ -36,7 +36,7 @@ async function main() {
 
   const server = new McpServer({
     name: "peer-agents-mcp",
-    version: "0.2.2",
+    version: "0.3.0",
   });
 
   server.tool(
@@ -299,6 +299,103 @@ async function main() {
         contextAdvisory ? { ...turnResult, contextAdvisory } : turnResult,
       );
     },
+  );
+
+  server.tool(
+    "peer_turn_async",
+    `${CONTEXT_PACKING_PREAMBLE} Start a long-running follow-up turn in the background. Returns a jobId immediately; poll peer_job_status every 30-60s.`,
+    {
+      session_id: z
+        .string()
+        .describe("session_id from a prior peer tool response."),
+      message: z
+        .string()
+        .describe(
+          "What changed since the last turn, what you fixed, and what you want the peer to do.",
+        ),
+      diff: diffSchema,
+      files: filesSchema,
+      idempotency_key: idempotencyKeySchema,
+      expected_version: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Pass version from the last turn to avoid stale-session races."),
+    },
+    async (input) =>
+      jsonResult(
+        await app.turnAsync({
+          sessionId: input.session_id,
+          message: input.message,
+          diff: input.diff,
+          files: input.files,
+          idempotencyKey: input.idempotency_key,
+          expectedVersion: input.expected_version,
+        }),
+      ),
+  );
+
+  server.tool(
+    "peer_implement_async",
+    `${CONTEXT_PACKING_PREAMBLE} Cold-start a long-running Grok implementation handoff in the background. Returns jobId + sessionId immediately; poll peer_job_status every 30-60s.`,
+    {
+      task: z
+        .string()
+        .describe(
+          "Required. Goal, success criteria, affected modules, and what done looks like.",
+        ),
+      repo_path: repoPathSchema,
+      message: z
+        .string()
+        .describe(
+          "Full implementation handoff for the peer: requirements, constraints, and starting point.",
+        ),
+      diff: diffSchema,
+      files: filesSchema,
+      system: z
+        .string()
+        .optional()
+        .describe("Optional extra system instructions for the implementer session."),
+      use_worktree: z
+        .boolean()
+        .optional()
+        .describe(
+          "Isolate Grok edits in a git worktree (default true). Set false only if you want the peer to edit the main working tree.",
+        ),
+      idempotency_key: idempotencyKeySchema,
+    },
+    async (input) =>
+      jsonResult(
+        await app.implementAsync({
+          task: input.task,
+          repoPath: input.repo_path,
+          message: input.message,
+          diff: input.diff,
+          files: input.files,
+          system: input.system,
+          useWorktree: input.use_worktree,
+          idempotencyKey: input.idempotency_key,
+        }),
+      ),
+  );
+
+  server.tool(
+    "peer_job_status",
+    "Poll status of a background peer job started by peer_turn_async or peer_implement_async. Returns result when status is succeeded.",
+    {
+      job_id: z.string().describe("jobId returned by an async start tool."),
+    },
+    async (input) => jsonResult(await app.getJobStatus({ jobId: input.job_id })),
+  );
+
+  server.tool(
+    "peer_job_cancel",
+    "Cancel a running or queued background peer job if this MCP server still owns the process.",
+    {
+      job_id: z.string().describe("jobId returned by an async start tool."),
+    },
+    async (input) => jsonResult(await app.cancelJob({ jobId: input.job_id })),
   );
 
   server.tool(
