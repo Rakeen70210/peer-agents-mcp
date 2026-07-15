@@ -46,7 +46,8 @@ export type PeerRunInput = {
   /** AbortSignal for cancellation; terminates the provider child process. */
   signal?: AbortSignal;
   /**
-   * Native CLI session id from a prior turn. Grok uses this with `--resume`.
+   * Native CLI session id from a prior turn.
+   * Grok uses this with `--resume`; Antigravity with `--conversation`.
    * When set, the prompt should be the current request only (history lives in CLI).
    */
   nativeSessionId?: string;
@@ -73,7 +74,7 @@ export type PeerRunInput = {
   streamProgress?: boolean;
   /** Progress callback for streaming turns (throttled by caller if needed). */
   onProgress?: (progress: PeerRunProgress) => void;
-  /** Absolute path or name for Grok `--agent`. */
+  /** Absolute path or name for provider `--agent` (Grok / Antigravity). */
   agent?: string;
 };
 

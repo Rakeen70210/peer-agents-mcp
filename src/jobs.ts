@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -72,7 +72,9 @@ export async function ensureJobsDir(jobsDir: string): Promise<void> {
 export async function saveJobToDir(jobsDir: string, job: StoredJob): Promise<void> {
   await ensureJobsDir(jobsDir);
   const target = jobFilePath(jobsDir, job.id);
-  const temp = `${target}.tmp`;
+  // Unique temp name so concurrent persist/cancel of the same job cannot
+  // race on a shared `.tmp` path (ENOENT on rename).
+  const temp = `${target}.${randomUUID()}.tmp`;
   const payload = JSON.stringify(job, null, 2);
   await writeFile(temp, payload, "utf8");
   await rename(temp, target);
@@ -95,7 +97,7 @@ export async function loadAllJobsFromDir(jobsDir: string): Promise<StoredJob[]> 
     const entries = await readdir(jobsDir);
     const jobs: StoredJob[] = [];
     for (const entry of entries) {
-      if (!entry.endsWith(".json") || entry.endsWith(".tmp")) continue;
+      if (!entry.endsWith(".json") || entry.includes(".tmp")) continue;
       try {
         const raw = await readFile(join(jobsDir, entry), "utf8");
         jobs.push(JSON.parse(raw) as StoredJob);

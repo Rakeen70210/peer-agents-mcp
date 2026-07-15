@@ -558,11 +558,14 @@ export function isLikelyResumeFailure(result: PeerRunResult): boolean {
   return (
     blob.includes("resume") ||
     blob.includes("session") ||
+    blob.includes("conversation") ||
     blob.includes("not found") ||
     blob.includes("couldn't start") ||
     blob.includes("could not") ||
     blob.includes("unknown session") ||
-    blob.includes("invalid session")
+    blob.includes("invalid session") ||
+    blob.includes("unknown conversation") ||
+    blob.includes("invalid conversation")
   );
 }
 

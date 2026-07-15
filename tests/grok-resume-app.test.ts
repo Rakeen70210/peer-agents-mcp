@@ -125,6 +125,74 @@ test("resume failure falls back to full transcript cold start", async () => {
   assert.match(grok.calls[2].constructedPrompt, /Recent turns:/);
 });
 
+class RecordingAntigravity implements PeerProvider {
+  readonly name = "antigravity" as const;
+  calls: PeerRunInput[] = [];
+  private readonly replies: Array<Partial<PeerRunResult> & { text: string }>;
+
+  constructor(replies: Array<Partial<PeerRunResult> & { text: string }>) {
+    this.replies = replies;
+  }
+
+  async healthCheck() {
+    return { ok: true, latencyMs: 1 };
+  }
+
+  async runTurn(input: PeerRunInput): Promise<PeerRunResult> {
+    this.calls.push(input);
+    const next = this.replies.shift() ?? { text: "done" };
+    return {
+      isError: next.isError ?? false,
+      text: next.text,
+      stdout: next.text,
+      stderr: next.stderr ?? "",
+      nativeSessionId: next.nativeSessionId ?? "agy-conv",
+      resumed: Boolean(input.nativeSessionId) && !(next.isError ?? false),
+    };
+  }
+}
+
+test("second antigravity turn resumes native conversation with compact prompt", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-agy-resume-app-"));
+  const antigravity = new RecordingAntigravity([
+    { text: "first", nativeSessionId: "agy-conv-1" },
+    { text: "second", nativeSessionId: "agy-conv-1" },
+  ]);
+
+  const app = createApp({
+    storageDir,
+    providers: {
+      grok: new RecordingGrok([{ text: "n/a" }]),
+      antigravity,
+    },
+  });
+  await app.hydrate();
+
+  const started = await app.start({
+    provider: "antigravity",
+    task: "ask",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  await app.turn({
+    sessionId: started.sessionId,
+    message: "What is X?",
+    idempotencyKey: "a1",
+  });
+  await app.turn({
+    sessionId: started.sessionId,
+    message: "And Y?",
+    idempotencyKey: "a2",
+    expectedVersion: 1,
+  });
+
+  assert.equal(antigravity.calls.length, 2);
+  assert.equal(antigravity.calls[0].nativeSessionId, undefined);
+  assert.equal(antigravity.calls[1].nativeSessionId, "agy-conv-1");
+  assert.match(antigravity.calls[1].constructedPrompt, /Continue the peer session/);
+  assert.doesNotMatch(antigravity.calls[1].constructedPrompt, /Recent turns:/);
+});
+
 test("implementAsync sets worktree name on session cold start", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "peer-wt-"));
   const grok = new RecordingGrok([

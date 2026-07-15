@@ -245,6 +245,15 @@ test("isLikelyResumeFailure detects session errors", () => {
   assert.equal(
     isLikelyResumeFailure({
       isError: true,
+      text: "",
+      stdout: "",
+      stderr: "unknown conversation id",
+    }),
+    true,
+  );
+  assert.equal(
+    isLikelyResumeFailure({
+      isError: true,
       text: "logic bug in code",
       stdout: "",
       stderr: "",

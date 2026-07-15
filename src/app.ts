@@ -544,9 +544,10 @@ export function createApp(options: AppOptions = {}) {
     userMessageForTranscript: string,
     runOptions?: PeerTurnOptions,
   ): Promise<TurnResult> {
-    // Only Grok headless supports native --resume today.
+    // Grok uses --resume; Antigravity uses --conversation (both via nativeSessionId).
     const canResume =
-      session.provider === "grok" && Boolean(session.nativeSessionId);
+      (session.provider === "grok" || session.provider === "antigravity") &&
+      Boolean(session.nativeSessionId);
 
     if (canResume) {
       const compact = enforcePromptLimit(

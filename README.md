@@ -150,6 +150,7 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `GROK_COMMAND` — path to grok binary (default: `grok`)
 - `ANTIGRAVITY_COMMAND` — path to agy binary (default: `agy`)
 - `GROK_ARGS` / `ANTIGRAVITY_ARGS` — JSON array of extra CLI args
+- `ANTIGRAVITY_CONVERSATIONS_DIR` — override agy conversation store used to capture native session ids (default: `~/.gemini/antigravity-cli/conversations`)
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
 - `PEER_AGENTS_TURN_TIMEOUT_MS` — per-turn synchronous timeout (default 120s for Grok, 300s for Antigravity)
 - `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override
@@ -166,6 +167,8 @@ Each routed call returns a `sessionId`. Use `peer_turn` to continue the conversa
 - Ask it to re-review or check your fixes
 
 Sessions are persisted to disk, so they survive across restarts of the MCP server.
+
+Grok and Antigravity multi-turn turns prefer **native CLI resume** when a conversation/session id was captured on the first turn; otherwise the MCP rehydrates recent transcript into the prompt.
 
 ## Grok CLI integration (0.2.x+)
 
@@ -184,6 +187,24 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | Async progress | `--output-format streaming-json` + `progress` on `peer_job_status` |
 | ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
+
+## Antigravity CLI integration (agy 1.1.x+)
+
+Antigravity peer turns use print mode under the hood (callers do not pass these flags):
+
+| Concern | Behavior |
+|---------|----------|
+| Invocation | `agy -p … --print-timeout … --dangerously-skip-permissions` |
+| Multi-turn | `--conversation <id>` when a new conversation was captured after cold start; falls back to MCP transcript rehydrate |
+| Session capture | Before/after scan of the conversations store (default `~/.gemini/antigravity-cli/conversations`); only attaches an id when exactly one new `*.db` appears |
+| Reviewer / critic | `--sandbox` |
+| Planner | `--sandbox --mode plan` |
+| Implementer | `--mode accept-edits` |
+| Workspace | `--add-dir <cwd>` when a repo path is set |
+| Agent | Optional `--agent` when provided |
+| Health | Prefer `agy models`; fall back to a short pong turn |
+
+agy does not expose Grok-style json-schema, streaming metrics, worktree, or prompt-file — those remain Grok-only.
 
 ## Design notes
 
