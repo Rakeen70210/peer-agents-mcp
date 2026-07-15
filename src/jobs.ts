@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { PeerProviderName } from "./providers/types.js";
+import type { PeerProviderName, PeerRunProgress } from "./providers/types.js";
 import { nowIso } from "./state.js";
 
 export type JobStatus =
@@ -28,6 +28,8 @@ export type StoredJob = {
   timeoutMs: number;
   result?: unknown;
   error?: string;
+  /** Live progress while running (streaming providers). */
+  progress?: PeerRunProgress;
 };
 
 export const TERMINAL_JOB_STATUSES: ReadonlySet<JobStatus> = new Set([
@@ -107,6 +109,47 @@ export async function loadAllJobsFromDir(jobsDir: string): Promise<StoredJob[]> 
   }
 }
 
+export async function deleteJobFromDir(
+  jobsDir: string,
+  jobId: string,
+): Promise<void> {
+  await rm(jobFilePath(jobsDir, jobId), { force: true });
+}
+
+/** Default retention for terminal jobs (7 days). */
+export const DEFAULT_JOB_GC_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Delete terminal jobs older than maxAgeMs.
+ * Non-terminal jobs are never deleted.
+ */
+export async function gcTerminalJobs(
+  jobsDir: string,
+  options?: { maxAgeMs?: number; now?: number },
+): Promise<{ deleted: string[]; retained: number }> {
+  const maxAgeMs = options?.maxAgeMs ?? DEFAULT_JOB_GC_MAX_AGE_MS;
+  const now = options?.now ?? Date.now();
+  const jobs = await loadAllJobsFromDir(jobsDir);
+  const deleted: string[] = [];
+  let retained = 0;
+
+  for (const job of jobs) {
+    if (!isTerminalJobStatus(job.status)) {
+      retained += 1;
+      continue;
+    }
+    const stamp = Date.parse(job.finishedAt ?? job.updatedAt);
+    if (!Number.isFinite(stamp) || now - stamp < maxAgeMs) {
+      retained += 1;
+      continue;
+    }
+    await deleteJobFromDir(jobsDir, job.id);
+    deleted.push(job.id);
+  }
+
+  return { deleted, retained };
+}
+
 export function createStoredJob(input: {
   id: string;
   sessionId: string;
@@ -142,6 +185,7 @@ export type JobStatusResponse = {
   finishedAt?: string;
   result?: unknown;
   error?: string;
+  progress?: PeerRunProgress;
 };
 
 export function formatJobStatus(job: StoredJob): JobStatusResponse {
@@ -160,5 +204,8 @@ export function formatJobStatus(job: StoredJob): JobStatusResponse {
     response.result = job.result;
   }
   if (job.error) response.error = job.error;
+  if (job.progress && (job.status === "running" || job.status === "queued")) {
+    response.progress = job.progress;
+  }
   return response;
 }

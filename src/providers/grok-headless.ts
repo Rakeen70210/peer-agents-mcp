@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  agentPathForFocus,
   capabilityProfileForMode,
   effortForRisk,
   shouldSelfVerify,
@@ -22,6 +23,7 @@ import type {
   PeerProvider,
   PeerRunInput,
   PeerRunMetrics,
+  PeerRunProgress,
   PeerRunResult,
 } from "./types.js";
 
@@ -135,6 +137,7 @@ export class GrokHeadlessProvider implements PeerProvider {
     const useStructured =
       options.allowStructured &&
       (input.structuredOutput ?? profile.preferStructuredOutput);
+    const stream = Boolean(input.streamProgress);
 
     const promptPath = await this.writePromptFile(input.constructedPrompt);
     try {
@@ -143,7 +146,7 @@ export class GrokHeadlessProvider implements PeerProvider {
         "--prompt-file",
         promptPath,
         "--output-format",
-        "json",
+        stream ? "streaming-json" : "json",
         ...profile.args,
       ];
 
@@ -181,6 +184,15 @@ export class GrokHeadlessProvider implements PeerProvider {
         args.push("--check");
       }
 
+      const agentPath = agentPathForFocus({
+        focus: input.focus,
+        mode: input.mode,
+        agent: input.agent,
+      });
+      if (agentPath) {
+        args.push("--agent", agentPath);
+      }
+
       if (useStructured) {
         args.push("--json-schema", JSON.stringify(PEER_FINDINGS_JSON_SCHEMA));
       }
@@ -195,12 +207,19 @@ export class GrokHeadlessProvider implements PeerProvider {
         ].join(" "),
       );
 
+      const streamState = stream
+        ? createStreamAccumulator(input.onProgress)
+        : undefined;
+
       const result = await runCommand({
         command: this.command,
         args,
         cwd: input.cwd,
         timeoutMs,
         signal: input.signal,
+        onStdoutLine: streamState
+          ? (line) => streamState.onLine(line)
+          : undefined,
       });
 
       if (result.aborted || input.signal?.aborted) {
@@ -211,18 +230,31 @@ export class GrokHeadlessProvider implements PeerProvider {
           stderr: "Grok cancelled",
           cancelled: true,
           worktreeName,
+          progress: streamState?.progress(),
         };
       }
 
       if (result.timedOut) {
         return {
           isError: true,
-          text: "",
+          text: streamState?.text() ?? "",
           stdout: result.stdout,
           stderr: `Grok timed out after ${timeoutMs}ms`,
           timedOut: true,
           worktreeName,
+          progress: streamState?.progress(),
         };
+      }
+
+      if (stream && streamState) {
+        return projectStreamingGrokResult({
+          streamState,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          worktreeName,
+          expectStructured: useStructured,
+        });
       }
 
       return projectGrokResult({
@@ -243,6 +275,160 @@ export class GrokHeadlessProvider implements PeerProvider {
     await writeFile(path, prompt, "utf8");
     return path;
   }
+}
+
+type StreamAccumulator = {
+  onLine: (line: string) => void;
+  text: () => string;
+  progress: () => PeerRunProgress;
+  endEvent: () => GrokJsonResponse | undefined;
+};
+
+export function createStreamAccumulator(
+  onProgress?: (progress: PeerRunProgress) => void,
+): StreamAccumulator {
+  let text = "";
+  let lastThought = "";
+  let eventCount = 0;
+  let endEvent: GrokJsonResponse | undefined;
+  let lastProgress: PeerRunProgress = {
+    updatedAt: new Date().toISOString(),
+    eventCount: 0,
+  };
+
+  const emit = () => {
+    lastProgress = {
+      updatedAt: new Date().toISOString(),
+      eventCount,
+      textSnippet: text.slice(-500) || undefined,
+      lastThought: lastThought.slice(-400) || undefined,
+      numTurns: endEvent?.num_turns,
+      stopReason: endEvent?.stopReason,
+    };
+    try {
+      onProgress?.(lastProgress);
+    } catch {
+      // ignore
+    }
+  };
+
+  return {
+    onLine(line: string) {
+      eventCount += 1;
+      const event = safeJsonParse<{
+        type?: string;
+        data?: string;
+        stopReason?: string;
+        sessionId?: string;
+        num_turns?: number;
+        usage?: GrokJsonResponse["usage"];
+        modelUsage?: Record<string, unknown>;
+        total_cost_usd?: number;
+        cost_is_partial?: boolean;
+        usage_is_incomplete?: boolean;
+        message?: string;
+      }>(line);
+      if (!event?.type) {
+        emit();
+        return;
+      }
+      if (event.type === "text" && typeof event.data === "string") {
+        text += event.data;
+      } else if (event.type === "thought" && typeof event.data === "string") {
+        lastThought = event.data;
+      } else if (event.type === "end") {
+        endEvent = {
+          text,
+          sessionId: event.sessionId,
+          stopReason: event.stopReason,
+          num_turns: event.num_turns,
+          usage: event.usage,
+          modelUsage: event.modelUsage,
+          total_cost_usd: event.total_cost_usd,
+          cost_is_partial: event.cost_is_partial,
+          usage_is_incomplete: event.usage_is_incomplete,
+        };
+      } else if (event.type === "error") {
+        endEvent = {
+          error: event.message ?? "stream error",
+          sessionId: event.sessionId,
+          stopReason: event.stopReason,
+          num_turns: event.num_turns,
+          usage: event.usage,
+        };
+      }
+      emit();
+    },
+    text: () => text,
+    progress: () => lastProgress,
+    endEvent: () => endEvent,
+  };
+}
+
+export function projectStreamingGrokResult(input: {
+  streamState: StreamAccumulator;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  worktreeName?: string;
+  expectStructured: boolean;
+}): PeerRunResult {
+  const end = input.streamState.endEvent();
+  const rawText = (end?.text ?? input.streamState.text()).trim();
+  const progress = input.streamState.progress();
+
+  if (end?.error) {
+    return {
+      isError: true,
+      text: end.error,
+      stdout: input.stdout,
+      stderr: input.stderr || end.error,
+      nativeSessionId: end.sessionId,
+      metrics: metricsFromGrokJson(end),
+      worktreeName: input.worktreeName,
+      progress,
+    };
+  }
+
+  if (rawText || input.exitCode === 0) {
+    let structured: unknown;
+    let text = rawText;
+    if (input.expectStructured) {
+      structured = tryParseStructured(rawText);
+      if (structured) {
+        const pretty = formatStructuredAsText(structured);
+        if (pretty) text = pretty;
+      }
+    }
+    return {
+      isError: false,
+      text,
+      stdout: input.stdout,
+      stderr: input.stderr,
+      nativeSessionId: end?.sessionId,
+      metrics: metricsFromGrokJson(
+        end ?? {
+          text: rawText,
+          stopReason: progress.stopReason,
+          num_turns: progress.numTurns,
+        },
+      ),
+      structured,
+      worktreeName: input.worktreeName,
+      progress,
+    };
+  }
+
+  return {
+    isError: true,
+    text: rawText,
+    stdout: input.stdout,
+    stderr:
+      input.stderr ||
+      `Grok exited with code ${input.exitCode ?? "unknown"}`,
+    worktreeName: input.worktreeName,
+    progress,
+  };
 }
 
 export function projectGrokResult(input: {

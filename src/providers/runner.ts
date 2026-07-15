@@ -16,6 +16,10 @@ export async function runCommand(options: {
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  /** Optional stdout chunk callback (streaming progress). */
+  onStdout?: (chunk: string) => void;
+  /** Optional complete-line callback (NDJSON / streaming-json). */
+  onStdoutLine?: (line: string) => void;
 }): Promise<SpawnResult> {
   if (options.signal?.aborted) {
     return {
@@ -40,6 +44,7 @@ export async function runCommand(options: {
 
     let stdout = "";
     let stderr = "";
+    let lineBuffer = "";
     let timedOut = false;
     let aborted = false;
     let settled = false;
@@ -49,6 +54,14 @@ export async function runCommand(options: {
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
+      if (options.onStdoutLine && lineBuffer.trim()) {
+        try {
+          options.onStdoutLine(lineBuffer);
+        } catch {
+          // ignore progress handler errors
+        }
+        lineBuffer = "";
+      }
       resolve(result);
     };
 
@@ -102,7 +115,29 @@ export async function runCommand(options: {
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      try {
+        options.onStdout?.(text);
+      } catch {
+        // ignore
+      }
+      if (options.onStdoutLine) {
+        lineBuffer += text;
+        let newline = lineBuffer.indexOf("\n");
+        while (newline >= 0) {
+          const line = lineBuffer.slice(0, newline).replace(/\r$/, "");
+          lineBuffer = lineBuffer.slice(newline + 1);
+          if (line.trim()) {
+            try {
+              options.onStdoutLine(line);
+            } catch {
+              // ignore
+            }
+          }
+          newline = lineBuffer.indexOf("\n");
+        }
+      }
     });
     child.stderr.on("data", (chunk: Buffer | string) => {
       stderr += chunk.toString();

@@ -36,7 +36,7 @@ async function main() {
 
   const server = new McpServer({
     name: "peer-agents-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   server.tool(
@@ -381,8 +381,75 @@ async function main() {
   );
 
   server.tool(
+    "peer_review_diff_async",
+    `${CONTEXT_PACKING_PREAMBLE} Long-running diff review as a background job (large monorepos). Returns jobId immediately; poll peer_job_status every 30-60s. progress may include textSnippet while running.`,
+    {
+      diff: z
+        .string()
+        .describe(
+          "Required. Full unified diff. Prefer this over peer_review_diff when the review may exceed the client tool timeout.",
+        ),
+      repo_path: repoPathSchema,
+      focus: focusSchema,
+      risk_level: riskSchema,
+      files: filesSchema,
+      task: taskSchema,
+      idempotency_key: idempotencyKeySchema,
+    },
+    async (input) =>
+      jsonResult(
+        await app.reviewDiffAsync({
+          diff: input.diff,
+          repoPath: input.repo_path,
+          focus: input.focus,
+          riskLevel: input.risk_level,
+          files: input.files,
+          task: input.task,
+          idempotencyKey: input.idempotency_key,
+        }),
+      ),
+  );
+
+  server.tool(
+    "peer_debug_async",
+    `${CONTEXT_PACKING_PREAMBLE} Long-running debug handoff as a background job (huge logs / multi-attempt). Returns jobId immediately; poll peer_job_status every 30-60s.`,
+    {
+      error_log: z
+        .string()
+        .describe(
+          "Required. Full stderr, stack traces, and failing test output.",
+        ),
+      repo_path: repoPathSchema,
+      attempted_fixes: z
+        .string()
+        .optional()
+        .describe("Everything already tried and why each failed."),
+      failed_attempts: z.number().int().nonnegative().optional(),
+      diff: diffSchema,
+      files: filesSchema,
+      task: taskSchema,
+      risk_level: riskSchema,
+      idempotency_key: idempotencyKeySchema,
+    },
+    async (input) =>
+      jsonResult(
+        await app.debugAsync({
+          errorLog: input.error_log,
+          repoPath: input.repo_path,
+          attemptedFixes: input.attempted_fixes,
+          failedAttempts: input.failed_attempts,
+          diff: input.diff,
+          files: input.files,
+          task: input.task,
+          riskLevel: input.risk_level,
+          idempotencyKey: input.idempotency_key,
+        }),
+      ),
+  );
+
+  server.tool(
     "peer_job_status",
-    "Poll status of a background peer job started by peer_turn_async or peer_implement_async. Returns result when status is succeeded.",
+    "Poll status of a background peer job. While running, may include progress (textSnippet, lastThought, eventCount). Returns result when status is succeeded.",
     {
       job_id: z.string().describe("jobId returned by an async start tool."),
     },
@@ -396,6 +463,21 @@ async function main() {
       job_id: z.string().describe("jobId returned by an async start tool."),
     },
     async (input) => jsonResult(await app.cancelJob({ jobId: input.job_id })),
+  );
+
+  server.tool(
+    "peer_jobs_gc",
+    "Delete terminal background jobs older than max_age_ms (default 7 days / PEER_AGENTS_JOB_GC_MAX_AGE_MS). Non-terminal jobs are never deleted.",
+    {
+      max_age_ms: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Retention window in milliseconds (default 7 days)."),
+    },
+    async (input) =>
+      jsonResult(await app.gcJobs({ maxAgeMs: input.max_age_ms })),
   );
 
   server.tool(

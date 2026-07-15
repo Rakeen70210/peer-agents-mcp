@@ -10,6 +10,7 @@ import {
 import {
   createStoredJob,
   formatJobStatus,
+  gcTerminalJobs,
   isTerminalJobStatus,
   jobIdFrom,
   jobsDirFor,
@@ -39,6 +40,7 @@ import type {
   PeerProvider,
   PeerProviderName,
   PeerRunMetrics,
+  PeerRunProgress,
   PeerRunResult,
 } from "./providers/types.js";
 import { parsePositiveInt } from "./providers/runner.js";
@@ -106,6 +108,9 @@ type PeerTurnOptions = {
   /** Override structured output (default from provider profile). */
   structuredOutput?: boolean;
   selfVerify?: boolean;
+  /** Enable streaming-json progress (async jobs). */
+  streamProgress?: boolean;
+  onProgress?: (progress: PeerRunProgress) => void;
 };
 
 type LiveJob = {
@@ -294,6 +299,12 @@ export function createApp(options: AppOptions = {}) {
       sessions.set(session.id, session);
     }
     await reconcileJobs();
+    // Best-effort cleanup of old terminal jobs (non-blocking for correctness).
+    const maxAgeMs = parsePositiveInt(
+      process.env.PEER_AGENTS_JOB_GC_MAX_AGE_MS,
+      7 * 24 * 60 * 60 * 1000,
+    );
+    await gcTerminalJobs(jobsDir, { maxAgeMs }).catch(() => undefined);
   }
 
   async function persist(session: Session): Promise<void> {
@@ -518,6 +529,8 @@ export function createApp(options: AppOptions = {}) {
           : undefined,
       structuredOutput: runOptions?.structuredOutput,
       selfVerify: runOptions?.selfVerify,
+      streamProgress: runOptions?.streamProgress,
+      onProgress: runOptions?.onProgress,
     });
   }
 
@@ -668,6 +681,9 @@ export function createApp(options: AppOptions = {}) {
     diff?: string;
     files?: Array<{ path: string; content: string }>;
     expectedVersion?: number;
+    riskLevel?: RiskLevel;
+    focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+    complexity?: "simple" | "complex";
   }): LiveJob {
     const { session, job } = input;
     const abortController = new AbortController();
@@ -715,6 +731,7 @@ export function createApp(options: AppOptions = {}) {
           await transitionJob(job, { status: "running", startedAt });
 
           try {
+            let lastProgressWrite = 0;
             const result = await runPeerTurn(
               session,
               {
@@ -726,6 +743,20 @@ export function createApp(options: AppOptions = {}) {
               {
                 timeoutMs: job.timeoutMs,
                 signal: abortController.signal,
+                streamProgress: session.provider === "grok",
+                riskLevel: input.riskLevel,
+                focus: input.focus,
+                complexity: input.complexity,
+                onProgress: (progress) => {
+                  job.progress = progress;
+                  job.updatedAt = progress.updatedAt;
+                  const now = Date.now();
+                  // Throttle disk writes to ~1/s while streaming.
+                  if (now - lastProgressWrite >= 1000) {
+                    lastProgressWrite = now;
+                    void persistJob(job);
+                  }
+                },
               },
             );
 
@@ -1217,6 +1248,9 @@ export function createApp(options: AppOptions = {}) {
       message: string;
       diff?: string;
       files?: Array<{ path: string; content: string }>;
+      riskLevel?: RiskLevel;
+      focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+      complexity?: "simple" | "complex";
     }): Promise<JobStatusResponse> {
       await hydrate();
       const session = getSession(input.sessionId);
@@ -1283,6 +1317,9 @@ export function createApp(options: AppOptions = {}) {
         diff: input.diff,
         files: input.files,
         expectedVersion: input.expectedVersion,
+        riskLevel: input.riskLevel,
+        focus: input.focus,
+        complexity: input.complexity,
       });
       return formatJobStatus(job);
     },
@@ -1327,6 +1364,83 @@ export function createApp(options: AppOptions = {}) {
         diff: input.diff,
         files: input.files,
       });
+    },
+
+    /**
+     * Long-running diff review as a background job (large monorepo reviews).
+     * Always routes to Grok implementer-safe reviewer mode (read-only profile).
+     */
+    async reviewDiffAsync(input: {
+      diff: string;
+      repoPath: string;
+      idempotencyKey: string;
+      focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+      riskLevel?: RiskLevel;
+      files?: Array<{ path: string; content: string }>;
+      task?: string;
+    }): Promise<JobStatusResponse> {
+      const focus = input.focus ?? "general";
+      const task = input.task ?? `review-diff-async:${focus}`;
+      const started = await app.start({
+        provider: "grok",
+        task,
+        repoPath: input.repoPath,
+        mode: "reviewer",
+      });
+      return app.turnAsync({
+        sessionId: started.sessionId,
+        message: reviewDiffMessage(focus),
+        diff: input.diff,
+        files: input.files,
+        idempotencyKey: input.idempotencyKey,
+        riskLevel: input.riskLevel,
+        focus,
+      });
+    },
+
+    /**
+     * Long-running debug handoff as a background job (large logs / multi-attempt).
+     */
+    async debugAsync(input: {
+      errorLog: string;
+      repoPath: string;
+      idempotencyKey: string;
+      attemptedFixes?: string;
+      failedAttempts?: number;
+      diff?: string;
+      files?: Array<{ path: string; content: string }>;
+      task?: string;
+      riskLevel?: RiskLevel;
+    }): Promise<JobStatusResponse> {
+      const task = input.task ?? "debug-async";
+      const started = await app.start({
+        provider: "grok",
+        task,
+        repoPath: input.repoPath,
+        mode: "critic",
+      });
+      return app.turnAsync({
+        sessionId: started.sessionId,
+        message: debugMessage({
+          errorLog: input.errorLog,
+          attemptedFixes: input.attemptedFixes,
+        }),
+        diff: input.diff,
+        files: input.files,
+        idempotencyKey: input.idempotencyKey,
+        riskLevel: input.riskLevel ?? (input.failedAttempts && input.failedAttempts >= 2 ? "high" : "medium"),
+      });
+    },
+
+    async gcJobs(input?: { maxAgeMs?: number }) {
+      await hydrate();
+      const maxAgeMs =
+        input?.maxAgeMs ??
+        parsePositiveInt(
+          process.env.PEER_AGENTS_JOB_GC_MAX_AGE_MS,
+          7 * 24 * 60 * 60 * 1000,
+        );
+      return gcTerminalJobs(jobsDir, { maxAgeMs });
     },
 
     async getJobStatus(input: { jobId: string }): Promise<JobStatusResponse> {

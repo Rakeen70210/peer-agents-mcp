@@ -8,7 +8,7 @@
 | 2 | Execution Plumbing | Done |
 | 3 | Async Turn MVP | Done |
 | 4 | Cold-Start Implementation Handoff | Done |
-| 5 | Optional Routed Async Entry Points | Not started |
+| 5 | Optional Routed Async Entry Points | Done |
 | 6 | Documentation and Smoke Coverage | Done |
 
 Key files: `src/jobs.ts`, `src/app.ts` (job manager), `src/providers/runner.ts`, `src/providers/{grok,antigravity}-headless.ts`, `src/providers/types.ts`, `src/index.ts`, `tests/jobs.test.ts`, `tests/runner-abort.test.ts`, `README.md`, `scripts/smoke.ts`.
@@ -422,15 +422,15 @@ new attempt.
 - [x] Add tests proving the tool creates a session, returns quickly, persists the
   session/job, and records the final transcript once.
 
-### Phase 5: Optional Routed Async Entry Points — not started
+### Phase 5: Optional Routed Async Entry Points — done
 
 After `peer_turn_async` and `peer_implement_async` are stable, add routed async
 wrappers only where they are useful:
 
-- [ ] Optional `peer_review_diff_async` for unusually large reviews.
-- [ ] Optional `peer_debug_async` for multi-log deep debugging.
+- [x] Optional `peer_review_diff_async` for unusually large reviews.
+- [x] Optional `peer_debug_async` for multi-log deep debugging.
 
-Avoid duplicating every routed tool until there is a real use case.
+Also: streaming-json progress on jobs, terminal job GC, packaged specialist agents.
 
 ### Phase 6: Documentation and Smoke Coverage — done
 

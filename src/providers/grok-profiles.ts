@@ -1,4 +1,10 @@
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type { PeerComplexity, PeerFocus, PeerMode, PeerRiskLevel } from "./types.js";
+
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export type GrokCapabilityProfile = {
   /** CLI args after prompt-file / resume / output-format. */
@@ -102,4 +108,27 @@ export function shouldSelfVerify(input: {
   if (input.selfVerify === false) return false;
   if (input.mode !== "reviewer" && input.mode !== "critic") return false;
   return input.riskLevel === "high" || input.focus === "security";
+}
+
+/**
+ * Resolve packaged specialist agent definition for Grok `--agent`.
+ * Returns absolute path when the agent file exists.
+ */
+export function agentPathForFocus(input: {
+  focus?: PeerFocus;
+  mode: PeerMode;
+  agent?: string;
+}): string | undefined {
+  if (input.agent?.trim()) {
+    return input.agent.trim();
+  }
+  let relative: string | undefined;
+  if (input.focus === "security") {
+    relative = "agents/security-reviewer.md";
+  } else if (input.focus === "architecture" || input.mode === "planner") {
+    relative = "agents/architect-planner.md";
+  }
+  if (!relative) return undefined;
+  const absolute = join(PACKAGE_ROOT, relative);
+  return existsSync(absolute) ? absolute : undefined;
 }

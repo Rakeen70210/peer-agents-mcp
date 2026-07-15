@@ -35,11 +35,14 @@ Smart routing happens automatically based on the type of request.
 | `peer_ask`             | General grounded Q&A                         | Antigravity   |
 | `peer_debate`          | Independently compare Plan A vs Plan B       | Grok          |
 | `peer_turn`            | Continue a multi-turn peer session           | Same peer     |
-| `peer_turn_async`      | Long-running follow-up turn (background job) | Same peer     |
-| `peer_implement_async` | Cold-start Grok implementation handoff (job) | Grok          |
-| `peer_job_status`      | Poll a background job                        | —             |
-| `peer_job_cancel`      | Cancel a background job                      | —             |
-| `peer_compare`         | Low-level side-by-side call to both CLIs     | Both          |
+| `peer_turn_async`          | Long-running follow-up turn (background job) | Same peer     |
+| `peer_implement_async`     | Cold-start Grok implementation handoff (job) | Grok          |
+| `peer_review_diff_async`   | Long-running diff review (background job)    | Grok          |
+| `peer_debug_async`         | Long-running debug handoff (background job)  | Grok          |
+| `peer_job_status`          | Poll a background job (includes `progress`)  | —             |
+| `peer_job_cancel`          | Cancel a background job                      | —             |
+| `peer_jobs_gc`             | Garbage-collect old terminal jobs            | —             |
+| `peer_compare`             | Low-level side-by-side call to both CLIs     | Both          |
 
 Additional session tools: `peer_summarize`, `peer_transcript`, `peer_list_sessions`, `peer_reset`, and `peer_health`.
 
@@ -52,8 +55,9 @@ Large implementation handoffs can exceed the MCP client's synchronous tool timeo
 1. Start work with `peer_implement_async` (cold start) or `peer_turn_async` (existing session).
 2. Continue local work while the peer runs.
 3. Poll `peer_job_status` every **30–60 seconds** (avoid aggressive polling).
-4. When `status` is `succeeded`, read `result` and continue with `peer_turn` if needed.
-5. Use `peer_job_cancel` to stop a queued/running job owned by this MCP process.
+4. While `status` is `running`, optional `progress` may include `textSnippet`, `lastThought`, and `eventCount` (Grok streaming-json).
+5. When `status` is `succeeded`, read `result` and continue with `peer_turn` if needed.
+6. Use `peer_job_cancel` to stop a queued/running job owned by this MCP process.
 
 Terminal statuses: `succeeded`, `failed`, `timed_out`, `cancelled`, `orphaned`.
 
@@ -61,10 +65,13 @@ Idempotency: retries with the same `idempotency_key` return the same job (runnin
 
 Jobs and completed results are stored under `~/.peer-agents/jobs/`. Live provider processes do **not** survive MCP server restarts; non-terminal jobs are marked `orphaned` on hydrate (unless the session already committed the operation, which recovers as `succeeded`).
 
+Terminal jobs older than **7 days** are garbage-collected on hydrate (override with `PEER_AGENTS_JOB_GC_MAX_AGE_MS`) or via `peer_jobs_gc`.
+
 Async jobs use a separate timeout from synchronous turns:
 
 - `PEER_AGENTS_JOB_TIMEOUT_MS` — default **30 minutes** (`1800000`)
 - `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional per-provider overrides
+- `PEER_AGENTS_JOB_GC_MAX_AGE_MS` — terminal job retention (default 7 days)
 
 Keep the MCP server process alive for the duration of a job.
 
@@ -159,6 +166,8 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | `peer_implement_async` | Default git `--worktree` isolation (`use_worktree: false` to opt out) |
 | Review findings | `--json-schema` structured findings when useful; also returned as `structured` |
 | Risk / security | Elevated `--effort` and optional `--check` self-verify |
+| Specialists | Packaged `--agent` for security review / architecture planning |
+| Async progress | `--output-format streaming-json` + `progress` on `peer_job_status` |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
 
 ## Design notes

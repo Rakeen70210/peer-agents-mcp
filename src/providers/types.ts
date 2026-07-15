@@ -66,6 +66,25 @@ export type PeerRunInput = {
   structuredOutput?: boolean;
   /** Append Grok self-verification loop (`--check`). */
   selfVerify?: boolean;
+  /**
+   * Use streaming-json and report progress (async jobs).
+   * Final result still aggregates full text + end-event metadata.
+   */
+  streamProgress?: boolean;
+  /** Progress callback for streaming turns (throttled by caller if needed). */
+  onProgress?: (progress: PeerRunProgress) => void;
+  /** Absolute path or name for Grok `--agent`. */
+  agent?: string;
+};
+
+/** Live progress snapshot during a streaming provider turn. */
+export type PeerRunProgress = {
+  updatedAt: string;
+  eventCount: number;
+  textSnippet?: string;
+  lastThought?: string;
+  numTurns?: number;
+  stopReason?: string;
 };
 
 export type PeerRunResult = {
@@ -83,6 +102,8 @@ export type PeerRunResult = {
   structured?: unknown;
   /** Worktree name passed to Grok when isolation was requested. */
   worktreeName?: string;
+  /** Last progress snapshot when streamProgress was enabled. */
+  progress?: PeerRunProgress;
 };
 
 export interface PeerProvider {
