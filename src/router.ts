@@ -1,5 +1,6 @@
 import { hasMultimodalExtension, isBinaryAttachment } from "./attachments.js";
 import type { RoutedProvider } from "./catalog.js";
+import type { PeerProviderName } from "./providers/types.js";
 
 export type TaskKind =
   | "plan"
@@ -27,6 +28,8 @@ export type RouteInput = {
   needsDeepReasoning?: boolean;
   complexity?: "simple" | "complex";
   focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+  /** When set, preferred routes outside this set are remapped to enabled peers. */
+  enabledProviders?: ReadonlySet<PeerProviderName>;
 };
 
 export type RouteDecision = {
@@ -35,6 +38,7 @@ export type RouteDecision = {
   rationale: string[];
 };
 
+const ALL_PROVIDERS: PeerProviderName[] = ["grok", "antigravity"];
 const LARGE_CONTEXT_THRESHOLD = 150_000;
 
 const CODING_TASK_KINDS = new Set<TaskKind>([
@@ -49,30 +53,104 @@ const CODING_TASK_KINDS = new Set<TaskKind>([
   "debate",
 ]);
 
+function parseProviderList(raw: string | undefined): PeerProviderName[] {
+  if (!raw?.trim()) return [];
+  const out: PeerProviderName[] = [];
+  for (const part of raw.split(/[,\s]+/)) {
+    const name = part.trim().toLowerCase();
+    if (name === "grok" || name === "antigravity") {
+      if (!out.includes(name)) out.push(name);
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve which peer CLIs are active for this server process.
+ *
+ * - `PEER_AGENTS_ENABLED_PROVIDERS=antigravity` — whitelist (use when host is Grok)
+ * - `PEER_AGENTS_DISABLED_PROVIDERS=grok` — blacklist
+ * - Enabled list wins if both are set
+ */
+export function resolveEnabledProviders(options?: {
+  enabledProviders?: PeerProviderName[];
+  disabledProviders?: PeerProviderName[];
+  env?: NodeJS.ProcessEnv;
+}): Set<PeerProviderName> {
+  const env = options?.env ?? process.env;
+  const fromEnabledOpt = options?.enabledProviders;
+  const fromEnabledEnv = parseProviderList(env.PEER_AGENTS_ENABLED_PROVIDERS);
+  const enabledList =
+    fromEnabledOpt && fromEnabledOpt.length > 0
+      ? fromEnabledOpt
+      : fromEnabledEnv.length > 0
+        ? fromEnabledEnv
+        : null;
+
+  if (enabledList) {
+    return new Set(enabledList);
+  }
+
+  const disabled = new Set<PeerProviderName>([
+    ...(options?.disabledProviders ?? []),
+    ...parseProviderList(env.PEER_AGENTS_DISABLED_PROVIDERS),
+  ]);
+  return new Set(ALL_PROVIDERS.filter((p) => !disabled.has(p)));
+}
+
+/** Remap preferred routes onto the enabled provider set (fallback when preferred is off). */
+export function applyEnabledProviders(
+  decision: RouteDecision,
+  enabled: ReadonlySet<PeerProviderName>,
+): RouteDecision {
+  if (enabled.size === 0) {
+    throw new Error(
+      "No peer providers enabled. Set PEER_AGENTS_ENABLED_PROVIDERS or clear PEER_AGENTS_DISABLED_PROVIDERS.",
+    );
+  }
+
+  const filtered = decision.routes.filter((route) => enabled.has(route));
+  if (filtered.length > 0) {
+    return { ...decision, routes: filtered };
+  }
+
+  const fallback = ALL_PROVIDERS.filter((p) => enabled.has(p)) as RoutedProvider[];
+  return {
+    routes: fallback,
+    parallel: decision.parallel,
+    rationale: [
+      ...decision.rationale,
+      `Preferred route unavailable (disabled); falling back to ${fallback.join(", ")}`,
+    ],
+  };
+}
+
 export function routePeerTask(input: RouteInput): RouteDecision {
   const rationale: string[] = [];
 
+  let decision: RouteDecision;
   if (input.hasImagesOrPdf || input.kind === "ui_multimodal") {
     rationale.push("Multimodal input → Antigravity");
-    return { routes: ["antigravity"], parallel: true, rationale };
-  }
-
-  if (
+    decision = { routes: ["antigravity"], parallel: true, rationale };
+  } else if (
     input.kind === "large_context" ||
     input.kind === "general_knowledge" ||
     (input.contextTokensEstimate ?? 0) > LARGE_CONTEXT_THRESHOLD
   ) {
     rationale.push("Large context or general knowledge → Antigravity");
-    return { routes: ["antigravity"], parallel: true, rationale };
-  }
-
-  if (CODING_TASK_KINDS.has(input.kind)) {
+    decision = { routes: ["antigravity"], parallel: true, rationale };
+  } else if (CODING_TASK_KINDS.has(input.kind)) {
     rationale.push("Coding task → Grok");
-    return { routes: ["grok"], parallel: true, rationale };
+    decision = { routes: ["grok"], parallel: true, rationale };
+  } else {
+    rationale.push("Default → Grok");
+    decision = { routes: ["grok"], parallel: true, rationale };
   }
 
-  rationale.push("Default → Grok");
-  return { routes: ["grok"], parallel: true, rationale };
+  if (input.enabledProviders) {
+    return applyEnabledProviders(decision, input.enabledProviders);
+  }
+  return decision;
 }
 
 export function estimateContextTokens(parts: Array<string | undefined>): number {

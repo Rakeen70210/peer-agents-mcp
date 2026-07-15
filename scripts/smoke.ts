@@ -56,7 +56,7 @@ async function main() {
   const health = await callTool(client, "peer_health", {});
   console.log("health:", JSON.stringify(health, null, 2));
   for (const p of health.providers ?? []) {
-    if (!p.ok) {
+    if (!p.ok && !p.disabled) {
       throw new Error(`provider ${p.provider} unhealthy: ${p.detail ?? "?"}`);
     }
   }

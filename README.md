@@ -152,6 +152,8 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `GROK_ARGS` / `ANTIGRAVITY_ARGS` — JSON array of extra CLI args
 - `ANTIGRAVITY_CONVERSATIONS_DIR` — override agy conversation store used to capture native session ids (default: `~/.gemini/antigravity-cli/conversations`)
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
+- `PEER_AGENTS_ENABLED_PROVIDERS` — comma list whitelist of peer CLIs (`grok`, `antigravity`). Use `antigravity` alone when the host is Grok so peers never re-enter Grok.
+- `PEER_AGENTS_DISABLED_PROVIDERS` — comma list blacklist (ignored if `PEER_AGENTS_ENABLED_PROVIDERS` is set)
 - `PEER_AGENTS_TURN_TIMEOUT_MS` — per-turn synchronous timeout (default 120s for Grok, 300s for Antigravity)
 - `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override
 - `PEER_AGENTS_JOB_TIMEOUT_MS` — async job timeout (default 30 minutes)

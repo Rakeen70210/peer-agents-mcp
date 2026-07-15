@@ -78,6 +78,39 @@ test("routed debate routes coding comparison to Grok only", async () => {
   assert.equal(antigravity.models.length, 0);
 });
 
+test("with Grok disabled, coding review routes to Antigravity only", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-agents-"));
+  const grok = new RecordingProvider("grok");
+  const antigravity = new RecordingProvider("antigravity");
+  const app = createApp({
+    storageDir,
+    providers: { grok, antigravity },
+    disabledProviders: ["grok"],
+  });
+  await app.hydrate();
+
+  const health = await app.health();
+  assert.deepEqual(health.enabledProviders, ["antigravity"]);
+  assert.equal(
+    health.providers.find((p) => p.provider === "grok")?.disabled,
+    true,
+  );
+
+  const result = await app.routedReviewDiff({
+    diff: "diff --git a/foo b/foo",
+    repoPath: "/tmp/demo-repo",
+    focus: "bugs",
+    riskLevel: "low",
+    idempotencyKey: "routed-review-no-grok-1",
+  });
+
+  assert.deepEqual(result.routes, ["antigravity"]);
+  assert.ok(result.results.antigravity);
+  assert.equal(result.results.grok, undefined);
+  assert.equal(grok.models.length, 0);
+  assert.equal(antigravity.models.length, 1);
+});
+
 test("routed ask routes general knowledge to Antigravity", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "peer-agents-"));
   const grok = new RecordingProvider("grok");

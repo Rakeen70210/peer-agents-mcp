@@ -47,6 +47,7 @@ import { parsePositiveInt } from "./providers/runner.js";
 import {
   estimateContextTokens,
   hasMultimodalAttachments,
+  resolveEnabledProviders,
   routePeerTask,
   type RiskLevel,
   type TaskKind,
@@ -76,6 +77,10 @@ export type AppOptions = {
   providers?: Partial<Record<PeerProviderName, PeerProvider>>;
   maxPromptChars?: number;
   recentTurnCount?: number;
+  /** Whitelist of peer CLIs. Env: PEER_AGENTS_ENABLED_PROVIDERS. */
+  enabledProviders?: PeerProviderName[];
+  /** Blacklist of peer CLIs. Env: PEER_AGENTS_DISABLED_PROVIDERS. */
+  disabledProviders?: PeerProviderName[];
 };
 
 type MutateInput = {
@@ -203,11 +208,35 @@ export function createApp(options: AppOptions = {}) {
     parsePositiveInt(process.env.PEER_AGENTS_MAX_PROMPT_CHARS, 120_000);
   const recentTurnCount = options.recentTurnCount ?? 8;
 
+  const enabledProviders = resolveEnabledProviders({
+    enabledProviders: options.enabledProviders,
+    disabledProviders: options.disabledProviders,
+  });
+
   const providers: Record<PeerProviderName, PeerProvider> = {
     grok: options.providers?.grok ?? createGrokProvider(),
     antigravity:
       options.providers?.antigravity ?? new AntigravityHeadlessProvider(),
   };
+
+  function assertProviderEnabled(name: PeerProviderName): void {
+    if (!enabledProviders.has(name)) {
+      throw new Error(
+        `Peer provider "${name}" is disabled for this server. ` +
+          `Enabled: ${[...enabledProviders].join(", ") || "(none)"}. ` +
+          `Set PEER_AGENTS_ENABLED_PROVIDERS or PEER_AGENTS_DISABLED_PROVIDERS.`,
+      );
+    }
+  }
+
+  /** Prefer Grok for coding-shaped jobs; fall back to any enabled peer. */
+  function codingProvider(): PeerProviderName {
+    if (enabledProviders.has("grok")) return "grok";
+    if (enabledProviders.has("antigravity")) return "antigravity";
+    throw new Error(
+      "No peer providers enabled. Set PEER_AGENTS_ENABLED_PROVIDERS or clear PEER_AGENTS_DISABLED_PROVIDERS.",
+    );
+  }
 
   const sessions = new Map<string, Session>();
   const liveJobs = new Map<string, LiveJob>();
@@ -835,11 +864,23 @@ export function createApp(options: AppOptions = {}) {
     async health() {
       const results = await Promise.all(
         (Object.keys(providers) as PeerProviderName[]).map(async (name) => {
+          if (!enabledProviders.has(name)) {
+            return {
+              provider: name,
+              ok: false,
+              latencyMs: 0,
+              disabled: true,
+              detail: "disabled (PEER_AGENTS_ENABLED_PROVIDERS / PEER_AGENTS_DISABLED_PROVIDERS)",
+            };
+          }
           const result = await providers[name].healthCheck();
-          return { provider: name, ...result };
+          return { provider: name, disabled: false, ...result };
         }),
       );
-      return { providers: results };
+      return {
+        providers: results,
+        enabledProviders: [...enabledProviders],
+      };
     },
 
     async start(input: {
@@ -854,6 +895,7 @@ export function createApp(options: AppOptions = {}) {
       worktreeName?: string;
     }) {
       await hydrate();
+      assertProviderEnabled(input.provider);
       const id =
         input.sessionId ??
         makeSessionId({
@@ -953,6 +995,7 @@ export function createApp(options: AppOptions = {}) {
         needsDeepReasoning: input.needsDeepReasoning,
         complexity: input.complexity,
         focus: input.focus,
+        enabledProviders,
       });
 
       const independentReview = decision.routes.length > 1;
@@ -1340,18 +1383,20 @@ export function createApp(options: AppOptions = {}) {
       /** Opt out of git worktree isolation (default: isolated worktree). */
       useWorktree?: boolean;
     }): Promise<JobStatusResponse> {
-      const useWorktree = input.useWorktree !== false;
+      const provider = codingProvider();
+      // Worktree isolation is a Grok CLI feature; skip when only Antigravity is enabled.
+      const useWorktree = provider === "grok" && input.useWorktree !== false;
       const worktreeName = useWorktree
         ? sanitizeWorktreeName(
             `peer-impl-${makeSessionId({
               repoPath: input.repoPath,
-              provider: "grok",
+              provider,
               task: input.task,
             }).slice(0, 12)}`,
           )
         : undefined;
       const started = await app.start({
-        provider: "grok",
+        provider,
         task: input.task,
         repoPath: input.repoPath,
         mode: "implementer",
@@ -1369,7 +1414,7 @@ export function createApp(options: AppOptions = {}) {
 
     /**
      * Long-running diff review as a background job (large monorepo reviews).
-     * Always routes to Grok implementer-safe reviewer mode (read-only profile).
+     * Routes to the preferred coding peer (Grok when enabled, else Antigravity).
      */
     async reviewDiffAsync(input: {
       diff: string;
@@ -1383,7 +1428,7 @@ export function createApp(options: AppOptions = {}) {
       const focus = input.focus ?? "general";
       const task = input.task ?? `review-diff-async:${focus}`;
       const started = await app.start({
-        provider: "grok",
+        provider: codingProvider(),
         task,
         repoPath: input.repoPath,
         mode: "reviewer",
@@ -1415,7 +1460,7 @@ export function createApp(options: AppOptions = {}) {
     }): Promise<JobStatusResponse> {
       const task = input.task ?? "debug-async";
       const started = await app.start({
-        provider: "grok",
+        provider: codingProvider(),
         task,
         repoPath: input.repoPath,
         mode: "critic",
@@ -1489,10 +1534,17 @@ export function createApp(options: AppOptions = {}) {
         return replay as CompareResult;
       }
 
-      const providersToRun =
+      const requested =
         input.providers && input.providers.length > 0
           ? [...new Set(input.providers)]
           : (["grok", "antigravity"] as PeerProviderName[]);
+      const providersToRun = requested.filter((p) => enabledProviders.has(p));
+      if (providersToRun.length === 0) {
+        throw new Error(
+          `No enabled providers among requested: ${requested.join(", ")}. ` +
+            `Enabled: ${[...enabledProviders].join(", ") || "(none)"}.`,
+        );
+      }
       const mode = input.mode ?? "reviewer";
       const parallel = input.parallel ?? mode !== "implementer";
       const turnInput = {
