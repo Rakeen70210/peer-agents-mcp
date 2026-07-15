@@ -36,7 +36,7 @@ async function main() {
 
   const server = new McpServer({
     name: "peer-agents-mcp",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.tool(
