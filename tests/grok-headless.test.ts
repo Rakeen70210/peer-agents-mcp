@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -77,7 +78,10 @@ test("grok reviewer profile uses read-only sandbox and prompt-file", async () =>
   assert.match(captured, /--sandbox\nread-only/);
   assert.match(captured, /--disallowed-tools\nsearch_replace,write/);
   assert.match(captured, /--disable-web-search/);
+  assert.match(captured, /--no-plan/);
+  assert.match(captured, /--no-subagents/);
   assert.doesNotMatch(captured, /--always-approve/);
+  assert.doesNotMatch(captured, /--check/);
   assert.match(captured, /PROMPT_BODY_BEGIN[\s\S]*Review this huge patch/);
 });
 
@@ -105,7 +109,8 @@ test("grok implementer profile always-approves and can request worktree", async 
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /--always-approve/);
   assert.match(captured, /--sandbox\nworkspace/);
-  assert.match(captured, /--worktree\npeer-impl-abc/);
+  // Grok 1.0 headless ignores --worktree; non-git cwd skips isolation.
+  assert.doesNotMatch(captured, /--worktree/);
   assert.doesNotMatch(captured, /--resume/);
 });
 
@@ -173,7 +178,7 @@ test("grok structured output uses json-schema and pretty-prints findings", async
   assert.match(captured, /--json-schema/);
 });
 
-test("high risk review enables effort and self-verify", async () => {
+test("high risk review enables effort and does not pass removed --check", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-grok-risk-"));
   const { scriptPath, captureFile } = await makeCaptureCli(dir, {
     text: "ok",
@@ -192,7 +197,8 @@ test("high risk review enables effort and self-verify", async () => {
   });
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /--effort\nhigh/);
-  assert.match(captured, /--check/);
+  assert.doesNotMatch(captured, /--check/);
+  assert.match(captured, /Self-verify/);
 });
 
 test("prompt files are cleaned up after the turn", async () => {
@@ -286,4 +292,64 @@ test("projectGrokResult handles error objects", () => {
   });
   assert.equal(result.isError, true);
   assert.match(result.text, /auth failed/);
+});
+
+test("grok planner uses permission-mode plan without no-plan", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-plan-"));
+  const { scriptPath, captureFile } = await makeCaptureCli(dir, {
+    text: "plan ok",
+    sessionId: "s",
+  });
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  await provider.runTurn({
+    constructedPrompt: "Plan the migration",
+    mode: "planner",
+    structuredOutput: false,
+  });
+  const captured = await readFile(captureFile, "utf8");
+  assert.match(captured, /--permission-mode\nplan/);
+  assert.doesNotMatch(captured, /--no-plan/);
+  assert.doesNotMatch(captured, /--no-subagents/);
+});
+
+test("git worktree isolation points --cwd at a real worktree", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "peer-grok-wt-repo-"));
+  const worktreeRoot = join(repo, "peer-worktrees");
+  execFileSync("git", ["init"], { cwd: repo });
+  execFileSync("git", ["config", "user.email", "peer@test"], { cwd: repo });
+  execFileSync("git", ["config", "user.name", "Peer Test"], { cwd: repo });
+  await writeFile(join(repo, "README.md"), "hi\n");
+  execFileSync("git", ["add", "."], { cwd: repo });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const { scriptPath, captureFile } = await makeCaptureCli(repo, {
+    text: "implemented",
+    sessionId: "sess-wt",
+  });
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(repo, "prompts"),
+    worktreeRoot,
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Implement in isolation",
+    mode: "implementer",
+    cwd: repo,
+    worktree: "peer-impl-wt",
+    structuredOutput: false,
+  });
+
+  assert.equal(result.isError, false);
+  assert.equal(result.worktreeName, "peer-impl-wt");
+  const captured = await readFile(captureFile, "utf8");
+  assert.doesNotMatch(captured, /--worktree/);
+  assert.match(captured, /--cwd\n.*peer-impl-wt/);
+  const listed = execFileSync("git", ["worktree", "list", "--porcelain"], {
+    cwd: repo,
+    encoding: "utf8",
+  });
+  assert.match(listed, /peer-impl-wt/);
 });

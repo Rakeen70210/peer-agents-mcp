@@ -10,6 +10,11 @@ import {
   shouldSelfVerify,
 } from "./grok-profiles.js";
 import {
+  ensurePeerWorktree,
+  sanitizeWorktreeName,
+} from "./grok-worktree.js";
+export { sanitizeWorktreeName };
+import {
   formatStructuredAsText,
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
@@ -53,6 +58,8 @@ export type GrokProviderOptions = {
   timeoutMs?: number;
   /** Override prompt staging directory (tests). */
   promptDir?: string;
+  /** Override git worktree parent directory (tests). */
+  worktreeRoot?: string;
 };
 
 export class GrokHeadlessProvider implements PeerProvider {
@@ -61,6 +68,7 @@ export class GrokHeadlessProvider implements PeerProvider {
   private readonly baseArgs: string[];
   private readonly timeoutMs: number;
   private readonly promptDir: string;
+  private readonly worktreeRoot?: string;
 
   constructor(options: GrokProviderOptions = {}) {
     this.command = options.command ?? process.env.GROK_COMMAND ?? "grok";
@@ -73,6 +81,8 @@ export class GrokHeadlessProvider implements PeerProvider {
       options.promptDir ??
       process.env.PEER_AGENTS_PROMPT_DIR ??
       join(tmpdir(), "peer-agents-prompts");
+    this.worktreeRoot =
+      options.worktreeRoot ?? process.env.PEER_AGENTS_WORKTREE_DIR;
   }
 
   async healthCheck() {
@@ -107,14 +117,21 @@ export class GrokHeadlessProvider implements PeerProvider {
     const timeoutMs = input.timeoutMs ?? this.timeoutMs;
     const resumeId = input.nativeSessionId?.trim() || undefined;
     const requestedWorktree = resolveWorktreeName(input);
-    // Only create a worktree on cold start; resume continues the existing tree.
-    const worktreeName = resumeId ? undefined : requestedWorktree;
+    let cwd = input.cwd;
+    if (requestedWorktree && input.cwd) {
+      const isolated = await ensurePeerWorktree({
+        repoPath: input.cwd,
+        name: requestedWorktree,
+        root: this.worktreeRoot,
+      });
+      if (isolated) cwd = isolated;
+    }
 
     const result = await this.invokeOnce({
-      input,
+      input: { ...input, cwd },
       timeoutMs,
       resumeId,
-      worktreeName,
+      worktreeName: requestedWorktree,
       allowStructured: true,
     });
 
@@ -159,9 +176,6 @@ export class GrokHeadlessProvider implements PeerProvider {
       if (input.cwd) {
         args.push("--cwd", input.cwd);
       }
-      if (worktreeName) {
-        args.push("--worktree", worktreeName);
-      }
 
       const effort = effortForRisk({
         riskLevel: input.riskLevel,
@@ -173,16 +187,12 @@ export class GrokHeadlessProvider implements PeerProvider {
         args.push("--effort", effort);
       }
 
-      if (
-        shouldSelfVerify({
-          riskLevel: input.riskLevel,
-          focus: input.focus,
-          mode: input.mode,
-          selfVerify: input.selfVerify,
-        })
-      ) {
-        args.push("--check");
-      }
+      const selfVerify = shouldSelfVerify({
+        riskLevel: input.riskLevel,
+        focus: input.focus,
+        mode: input.mode,
+        selfVerify: input.selfVerify,
+      });
 
       const agentPath = agentPathForFocus({
         focus: input.focus,
@@ -198,14 +208,17 @@ export class GrokHeadlessProvider implements PeerProvider {
       }
 
       // Extra rules for peer independence / role.
-      args.push(
-        "--rules",
-        [
-          "You are a peer agent consulted by another coding agent.",
-          "Be direct and actionable.",
-          "Do not assume you have seen another model's answer.",
-        ].join(" "),
-      );
+      const rules = [
+        "You are a peer agent consulted by another coding agent.",
+        "Be direct and actionable.",
+        "Do not assume you have seen another model's answer.",
+      ];
+      if (selfVerify) {
+        rules.push(
+          "Self-verify findings against the source before answering.",
+        );
+      }
+      args.push("--rules", rules.join(" "));
 
       const streamState = stream
         ? createStreamAccumulator(input.onProgress)
@@ -545,10 +558,6 @@ function resolveWorktreeName(input: PeerRunInput): string | undefined {
     return sanitizeWorktreeName(input.worktree.trim());
   }
   return sanitizeWorktreeName(`peer-${randomUUID().slice(0, 8)}`);
-}
-
-export function sanitizeWorktreeName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 64);
 }
 
 /** Heuristic for app-level resume fallback (rebuild full prompt, cold start). */

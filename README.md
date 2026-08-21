@@ -55,7 +55,7 @@ Large implementation handoffs can exceed the MCP client's synchronous tool timeo
 1. Start work with `peer_implement_async` (cold start) or `peer_turn_async` (existing session).
 2. Continue local work while the peer runs.
 3. Poll `peer_job_status` every **30–60 seconds** (avoid aggressive polling).
-4. While `status` is `running`, optional `progress` may include `textSnippet`, `lastThought`, and `eventCount` (Grok streaming-json).
+4. While `status` is `running`, optional `progress` may include `textSnippet`, `lastThought`, and `eventCount` (Grok `streaming-json` / agy `stream-json`).
 5. When `status` is `succeeded`, read `result` and continue with `peer_turn` if needed.
 6. Use `peer_job_cancel` to stop a queued/running job owned by this MCP process.
 
@@ -150,7 +150,8 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `GROK_COMMAND` — path to grok binary (default: `grok`)
 - `ANTIGRAVITY_COMMAND` — path to agy binary (default: `agy`)
 - `GROK_ARGS` / `ANTIGRAVITY_ARGS` — JSON array of extra CLI args
-- `ANTIGRAVITY_CONVERSATIONS_DIR` — override agy conversation store used to capture native session ids (default: `~/.gemini/antigravity-cli/conversations`)
+- `ANTIGRAVITY_CONVERSATIONS_DIR` — override agy conversation store used as fallback session-id capture (default: `~/.gemini/antigravity-cli/conversations`)
+- `PEER_AGENTS_WORKTREE_DIR` — parent directory for DIY Grok git worktrees (default: `~/.peer-agents/worktrees`)
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
 - `PEER_AGENTS_ENABLED_PROVIDERS` — comma list whitelist of peer CLIs (`grok`, `antigravity`). Use `antigravity` alone when the host is Grok so peers never re-enter Grok.
 - `PEER_AGENTS_DISABLED_PROVIDERS` — comma list blacklist (ignored if `PEER_AGENTS_ENABLED_PROVIDERS` is set)
@@ -172,7 +173,7 @@ Sessions are persisted to disk, so they survive across restarts of the MCP serve
 
 Grok and Antigravity multi-turn turns prefer **native CLI resume** when a conversation/session id was captured on the first turn; otherwise the MCP rehydrates recent transcript into the prompt.
 
-## Grok CLI integration (0.2.x+)
+## Grok CLI integration (1.0.x+)
 
 Grok peer turns use modern headless flags under the hood (callers do not pass these):
 
@@ -180,33 +181,38 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 |---------|----------|
 | Large prompts | Always `--prompt-file` (avoids argv limits) |
 | Multi-turn | `--resume <nativeSessionId>` when available; falls back to MCP transcript rehydrate |
-| Reviewer / planner / critic | `--sandbox read-only`, deny edit tools, no web search |
+| Reviewer / critic | `--sandbox read-only`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
+| Planner | `--sandbox read-only`, `--permission-mode plan` |
 | Implementer | `--sandbox workspace`, `--always-approve` |
-| `peer_implement_async` | Default git `--worktree` isolation (`use_worktree: false` to opt out) |
+| `peer_implement_async` | Default git worktree isolation via `git worktree add` + `--cwd` (`use_worktree: false` to opt out). Grok 1.0 headless ignores `--worktree`. |
 | Review findings | `--json-schema` structured findings when useful; also returned as `structured` |
-| Risk / security | Elevated `--effort` and optional `--check` self-verify |
+| Risk / security | Elevated `--effort`; extra self-verify `--rules` (Grok 1.0 removed `--check`) |
 | Specialists | Packaged `--agent` for security review / architecture planning |
 | Async progress | `--output-format streaming-json` + `progress` on `peer_job_status` |
 | ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
 
-## Antigravity CLI integration (agy 1.1.x+)
+## Antigravity CLI integration (agy 1.1.8+)
 
 Antigravity peer turns use print mode under the hood (callers do not pass these flags):
 
 | Concern | Behavior |
 |---------|----------|
-| Invocation | `agy -p … --print-timeout … --dangerously-skip-permissions` |
-| Multi-turn | `--conversation <id>` when a new conversation was captured after cold start; falls back to MCP transcript rehydrate |
-| Session capture | Before/after scan of the conversations store (default `~/.gemini/antigravity-cli/conversations`); only attaches an id when exactly one new `*.db` appears |
+| Invocation | `agy -p … --print-timeout … --dangerously-skip-permissions --output-format json --disable-slash-commands` |
+| Multi-turn | `--conversation <id>` from the json `conversation_id` (dir-snapshot of `*.db` is fallback only) |
+| Review findings | `--json-schema` structured findings for reviewer/critic; `structured_output` mapped to `structured` |
 | Reviewer / critic | `--sandbox` |
 | Planner | `--sandbox --mode plan` |
 | Implementer | `--mode accept-edits` |
+| Risk | `--effort` from the same risk/complexity map as Grok |
 | Workspace | `--add-dir <cwd>` when a repo path is set |
 | Agent | Optional `--agent` when provided |
+| Slash/skills | Always `--disable-slash-commands` so peer prompts cannot expand `/commands` |
+| Async progress | `--output-format stream-json` on async jobs + `progress` on `peer_job_status` |
 | Health | Prefer `agy models`; fall back to a short pong turn |
+| Spend telemetry | `metrics` from the json envelope (`usage`, `num_turns`) |
 
-agy does not expose Grok-style json-schema, streaming metrics, worktree, or prompt-file — those remain Grok-only.
+agy still has no worktree, `--prompt-file`, or ACP transport. Sync turns stay `--output-format json`; only background jobs stream.
 
 ## Design notes
 
@@ -214,7 +220,7 @@ agy does not expose Grok-style json-schema, streaming metrics, worktree, or prom
 - User messages in session transcripts are labeled from the caller's perspective (commonly "Codex").
 - Idempotency keys are supported so repeated calls with the same key are safe.
 - Context quality hints are returned when the input looks too thin (missing files, diffs, etc.).
-- Implementation handoffs default to a Grok worktree so the peer does not clobber a dirty main tree.
+- Implementation handoffs default to an isolated git worktree (`--cwd` into it) so the peer does not clobber a dirty main tree.
 
 ## License
 

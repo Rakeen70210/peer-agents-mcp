@@ -56,19 +56,19 @@ export type PeerRunInput = {
   complexity?: PeerComplexity;
   focus?: PeerFocus;
   /**
-   * When true (or a string name), start Grok in a new git worktree.
-   * String value is the worktree name; true derives a name from context.
+   * When true (or a string name), isolate Grok in a git worktree via `--cwd`
+   * (Grok 1.0 headless ignores `--worktree`). String value is the worktree name.
    */
   worktree?: boolean | string;
   /**
-   * Request structured JSON findings (Grok `--json-schema`).
+   * Request structured JSON findings (`--json-schema`).
    * Default: true for reviewer/critic when not resuming implementer work.
    */
   structuredOutput?: boolean;
-  /** Append Grok self-verification loop (`--check`). */
+  /** Extra self-verify instruction in `--rules` (Grok `--check` was removed in 1.0). */
   selfVerify?: boolean;
   /**
-   * Use streaming-json and report progress (async jobs).
+   * Use Grok `streaming-json` / agy `stream-json` and report progress (async jobs).
    * Final result still aggregates full text + end-event metadata.
    */
   streamProgress?: boolean;

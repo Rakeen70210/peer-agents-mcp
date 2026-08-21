@@ -19,6 +19,50 @@ async function callTool(
   return text ? JSON.parse(text) : result;
 }
 
+async function pollJob(
+  client: Client,
+  jobId: string,
+  label: string,
+): Promise<{ final: Record<string, unknown>; sawProgress: boolean }> {
+  let final: Record<string, unknown> = { jobId, status: "queued" };
+  let sawProgress = false;
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    final = await callTool(client, "peer_job_status", { job_id: jobId });
+    const progress = final.progress as
+      | { eventCount?: number; textSnippet?: string; lastThought?: string }
+      | undefined;
+    if (progress?.eventCount || progress?.textSnippet || progress?.lastThought) {
+      if (!sawProgress) {
+        console.log("%s progress:", label, JSON.stringify(progress));
+      }
+      sawProgress = true;
+    }
+    const status = String(final.status ?? "");
+    if (
+      status === "succeeded" ||
+      status === "failed" ||
+      status === "timed_out" ||
+      status === "cancelled" ||
+      status === "orphaned"
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  console.log("%s final:", label, JSON.stringify(final, null, 2));
+  if (final.status !== "succeeded") {
+    throw new Error(`${label} job did not succeed: ${final.status}`);
+  }
+  return { final, sawProgress };
+}
+
+function assertNoRemovedCheckFlag(blob: unknown, label: string) {
+  const text = JSON.stringify(blob);
+  if (/unexpected argument '--check'/i.test(text) || /unknown argument '--check'/i.test(text)) {
+    throw new Error(`${label} still passed removed Grok --check`);
+  }
+}
+
 async function main() {
   const transport = new StdioClientTransport({
     command: "node",
@@ -44,6 +88,8 @@ async function main() {
     "peer_health",
     "peer_ask",
     "peer_turn",
+    "peer_turn_async",
+    "peer_review_diff",
     "peer_implement_async",
     "peer_job_status",
   ];
@@ -62,6 +108,7 @@ async function main() {
   }
 
   // Synchronous routed call (creates session + turn) — exercises harness-style MCP use.
+  // peer_ask routes general knowledge to Antigravity (json envelope + --conversation resume).
   const ask = await callTool(client, "peer_ask", {
     question: "Reply with exactly: smoke-ok",
     repo_path: process.cwd(),
@@ -93,6 +140,41 @@ async function main() {
     throw new Error(`peer_turn failed: ${turn.response ?? "unknown"}`);
   }
 
+  // Async follow-up on the Antigravity session — exercises stream-json job progress.
+  const agyAsync = await callTool(client, "peer_turn_async", {
+    session_id: askSessionId,
+    message: "Reply with exactly: smoke-agy-async-ok",
+    idempotency_key: `smoke-agy-async-${Date.now()}`,
+    expected_version: turn.version ?? 2,
+  });
+  console.log("agy async start:", JSON.stringify(agyAsync, null, 2));
+  if (!agyAsync.jobId) {
+    throw new Error("peer_turn_async did not return jobId");
+  }
+  const agyDone = await pollJob(client, agyAsync.jobId, "agy async");
+  if (agyDone.sawProgress) {
+    console.log("agy async: observed peer_job_status.progress (stream-json)");
+  } else {
+    console.log(
+      "agy async: job succeeded without a captured progress snapshot (fast finish is ok)",
+    );
+  }
+
+  // High-risk Grok review: 1.0 removed --check; this must not hard-fail on that flag.
+  const review = await callTool(client, "peer_review_diff", {
+    diff: "diff --git a/smoke.txt b/smoke.txt\nindex 1111111..2222222 100644\n--- a/smoke.txt\n+++ b/smoke.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    repo_path: process.cwd(),
+    focus: "security",
+    risk_level: "high",
+    task: "Smoke test only. One-sentence review is enough; do not over-investigate.",
+    idempotency_key: `smoke-review-${Date.now()}`,
+  });
+  console.log("review:", JSON.stringify(review, null, 2));
+  assertNoRemovedCheckFlag(review, "peer_review_diff");
+  if (review.partialFailure || review.allSucceeded === false) {
+    throw new Error("peer_review_diff did not fully succeed");
+  }
+
   const asyncJob = await callTool(client, "peer_implement_async", {
     task: "smoke async implement",
     repo_path: process.cwd(),
@@ -104,25 +186,7 @@ async function main() {
   if (!asyncJob.jobId) {
     throw new Error("peer_implement_async did not return jobId");
   }
-
-  let final = asyncJob;
-  for (let attempt = 0; attempt < 90; attempt += 1) {
-    final = await callTool(client, "peer_job_status", { job_id: asyncJob.jobId });
-    if (
-      final.status === "succeeded" ||
-      final.status === "failed" ||
-      final.status === "timed_out" ||
-      final.status === "cancelled" ||
-      final.status === "orphaned"
-    ) {
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
-  }
-  console.log("async final:", JSON.stringify(final, null, 2));
-  if (final.status !== "succeeded") {
-    throw new Error(`async job did not succeed: ${final.status}`);
-  }
+  await pollJob(client, asyncJob.jobId, "grok async");
 
   console.log("smoke: all checks passed");
   await client.close();

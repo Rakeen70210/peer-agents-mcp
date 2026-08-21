@@ -278,6 +278,97 @@ test("debugAsync creates critic session job", async () => {
   assert.equal(grok.calls, 1);
 });
 
+class SlowStreamAgy implements PeerProvider {
+  readonly name = "antigravity" as const;
+  calls = 0;
+  sawStreamProgress = false;
+
+  async healthCheck() {
+    return { ok: true, latencyMs: 1 };
+  }
+
+  async runTurn(input: PeerRunInput): Promise<PeerRunResult> {
+    this.calls += 1;
+    this.sawStreamProgress = Boolean(input.streamProgress);
+    input.onProgress?.({
+      updatedAt: new Date().toISOString(),
+      eventCount: 1,
+      textSnippet: "agy working...",
+      lastThought: "run_command",
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    input.onProgress?.({
+      updatedAt: new Date().toISOString(),
+      eventCount: 2,
+      textSnippet: "agy almost done",
+      numTurns: 2,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    return {
+      isError: false,
+      text: "agy review complete",
+      stdout: "agy review complete",
+      stderr: "",
+      nativeSessionId: "agy-async",
+      progress: {
+        updatedAt: new Date().toISOString(),
+        eventCount: 2,
+        textSnippet: "agy almost done",
+        numTurns: 2,
+      },
+    };
+  }
+}
+
+test("antigravity async jobs enable streamProgress and surface job progress", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-agy-async-stream-"));
+  const agy = new SlowStreamAgy();
+  const app = createApp({
+    storageDir,
+    providers: {
+      grok: {
+        name: "grok",
+        healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+        runTurn: async () => ({
+          isError: false,
+          text: "n/a",
+          stdout: "",
+          stderr: "",
+        }),
+      },
+      antigravity: agy,
+    },
+  });
+  await app.hydrate();
+
+  const started = await app.start({
+    provider: "antigravity",
+    task: "stream progress",
+    repoPath: "/tmp/repo",
+    mode: "implementer",
+  });
+  const job = await app.turnAsync({
+    sessionId: started.sessionId,
+    message: "do long work",
+    idempotencyKey: "agy-async-stream-1",
+  });
+
+  const deadline = Date.now() + 3000;
+  let status = await app.getJobStatus({ jobId: job.jobId });
+  let sawProgress = Boolean(status.progress?.textSnippet);
+  while (status.status === "queued" || status.status === "running") {
+    if (status.progress?.textSnippet) sawProgress = true;
+    if (Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 15));
+    status = await app.getJobStatus({ jobId: job.jobId });
+  }
+
+  assert.equal(status.status, "succeeded");
+  assert.equal(agy.calls, 1);
+  assert.equal(agy.sawStreamProgress, true);
+  assert.ok(sawProgress);
+});
+
 test("hydrate auto-GCs ancient terminal jobs", async () => {
   const storageDir = await mkdtemp(join(tmpdir(), "peer-gc-app-"));
   const app = createApp({

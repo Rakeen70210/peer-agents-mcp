@@ -48,10 +48,8 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
           "--disallowed-tools",
           "search_replace,write",
           "--disable-web-search",
-          // Headless prompts that need tools cancel rather than hang;
-          // deny-by-default would block useful read shell — use sandbox instead.
           "--permission-mode",
-          "default",
+          "plan",
         ],
       };
     case "critic":
@@ -71,6 +69,8 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
           "--disable-web-search",
           "--permission-mode",
           "default",
+          "--no-plan",
+          "--no-subagents",
         ],
       };
   }

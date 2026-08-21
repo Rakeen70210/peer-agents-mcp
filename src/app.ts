@@ -113,7 +113,7 @@ type PeerTurnOptions = {
   /** Override structured output (default from provider profile). */
   structuredOutput?: boolean;
   selfVerify?: boolean;
-  /** Enable streaming-json progress (async jobs). */
+  /** Enable Grok streaming-json / agy stream-json progress (async jobs). */
   streamProgress?: boolean;
   onProgress?: (progress: PeerRunProgress) => void;
 };
@@ -552,10 +552,7 @@ export function createApp(options: AppOptions = {}) {
       riskLevel: runOptions?.riskLevel,
       complexity: runOptions?.complexity,
       focus: runOptions?.focus,
-      worktree:
-        !nativeSessionId && session.worktreeName
-          ? session.worktreeName
-          : undefined,
+      worktree: session.worktreeName,
       structuredOutput: runOptions?.structuredOutput,
       selfVerify: runOptions?.selfVerify,
       streamProgress: runOptions?.streamProgress,
@@ -773,7 +770,7 @@ export function createApp(options: AppOptions = {}) {
               {
                 timeoutMs: job.timeoutMs,
                 signal: abortController.signal,
-                streamProgress: session.provider === "grok",
+                streamProgress: true,
                 riskLevel: input.riskLevel,
                 focus: input.focus,
                 complexity: input.complexity,
