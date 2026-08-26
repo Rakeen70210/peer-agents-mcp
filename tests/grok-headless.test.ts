@@ -78,9 +78,12 @@ test("grok reviewer profile uses read-only sandbox and prompt-file", async () =>
   assert.match(captured, /--sandbox\nread-only/);
   assert.match(captured, /--disallowed-tools\nsearch_replace,write/);
   assert.match(captured, /--disable-web-search/);
+  assert.match(captured, /--always-approve/);
   assert.match(captured, /--no-plan/);
   assert.match(captured, /--no-subagents/);
-  assert.doesNotMatch(captured, /--always-approve/);
+  assert.match(captured, /--deny\nBash\(rm -rf \*\)/);
+  assert.match(captured, /--deny\nBash\(git push \*\)/);
+  assert.doesNotMatch(captured, /--permission-mode\ndefault/);
   assert.doesNotMatch(captured, /--check/);
   assert.match(captured, /PROMPT_BODY_BEGIN[\s\S]*Review this huge patch/);
 });
@@ -311,8 +314,14 @@ test("grok planner uses permission-mode plan without no-plan", async () => {
   });
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /--permission-mode\nplan/);
+  assert.match(captured, /--always-approve/);
+  assert.match(captured, /--sandbox\nread-only/);
+  assert.match(captured, /--disallowed-tools\nsearch_replace,write/);
+  assert.match(captured, /--deny\nBash\(rm -rf \*\)/);
+  assert.match(captured, /--deny\nBash\(git push \*\)/);
   assert.doesNotMatch(captured, /--no-plan/);
   assert.doesNotMatch(captured, /--no-subagents/);
+  assert.doesNotMatch(captured, /--permission-mode\ndefault/);
 });
 
 test("git worktree isolation points --cwd at a real worktree", async () => {

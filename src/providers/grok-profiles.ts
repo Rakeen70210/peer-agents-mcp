@@ -37,7 +37,7 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
       };
     case "planner":
       return {
-        alwaysApprove: false,
+        alwaysApprove: true,
         maxTurns: 30,
         preferStructuredOutput: false,
         args: [
@@ -50,13 +50,18 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
           "--disable-web-search",
           "--permission-mode",
           "plan",
+          "--always-approve",
+          "--deny",
+          "Bash(rm -rf *)",
+          "--deny",
+          "Bash(git push *)",
         ],
       };
     case "critic":
     case "reviewer":
     default:
       return {
-        alwaysApprove: false,
+        alwaysApprove: true,
         maxTurns: 25,
         preferStructuredOutput: true,
         args: [
@@ -67,10 +72,13 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
           "--disallowed-tools",
           "search_replace,write",
           "--disable-web-search",
-          "--permission-mode",
-          "default",
+          "--always-approve",
           "--no-plan",
           "--no-subagents",
+          "--deny",
+          "Bash(rm -rf *)",
+          "--deny",
+          "Bash(git push *)",
         ],
       };
   }

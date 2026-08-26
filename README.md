@@ -181,8 +181,8 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 |---------|----------|
 | Large prompts | Always `--prompt-file` (avoids argv limits) |
 | Multi-turn | `--resume <nativeSessionId>` when available; falls back to MCP transcript rehydrate |
-| Reviewer / critic | `--sandbox read-only`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
-| Planner | `--sandbox read-only`, `--permission-mode plan` |
+| Reviewer / critic | `--sandbox read-only`, `--always-approve`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
+| Planner | `--sandbox read-only`, `--permission-mode plan`, `--always-approve` |
 | Implementer | `--sandbox workspace`, `--always-approve` |
 | `peer_implement_async` | Default git worktree isolation via `git worktree add` + `--cwd` (`use_worktree: false` to opt out). Grok 1.0 headless ignores `--worktree`. |
 | Review findings | `--json-schema` structured findings when useful; also returned as `structured` |
