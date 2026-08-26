@@ -26,7 +26,9 @@ export function isIncompletePeerReview(input: {
       emptyArr(structured.residual_risks) &&
       emptyArr(structured.recommended_next_steps);
     if (!empty) return false;
-    return INTENT_RE.test(structured.summary?.trim() ?? "");
+    return INTENT_RE.test(
+      typeof structured.summary === "string" ? structured.summary.trim() : "",
+    );
   }
   const text = input.text.trim();
   if (!text) return true;

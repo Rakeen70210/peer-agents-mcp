@@ -160,6 +160,8 @@ test("grok implementer profile always-approves and can request worktree", async 
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /--always-approve/);
   assert.match(captured, /--sandbox\nworkspace/);
+  assert.match(captured, /Use tools \(read_file, grep, list_dir\)/);
+  assert.doesNotMatch(captured, /prefer a single JSON object/);
   // Grok 1.0 headless ignores --worktree; non-git cwd skips isolation.
   assert.doesNotMatch(captured, /--worktree/);
   assert.doesNotMatch(captured, /--resume/);
@@ -229,6 +231,7 @@ test("grok reviewer parses findings JSON without passing --json-schema", async (
   const captured = await readFile(captureFile, "utf8");
   assert.doesNotMatch(captured, /--json-schema/);
   assert.match(captured, /Use tools \(read_file, grep, list_dir\)/);
+  assert.match(captured, /prefer a single JSON object/);
 });
 
 test("complete prose without JSON is success with structured undefined", async () => {
@@ -395,6 +398,8 @@ test("grok planner uses permission-mode plan without no-plan", async () => {
   assert.doesNotMatch(captured, /--no-plan/);
   assert.doesNotMatch(captured, /--no-subagents/);
   assert.doesNotMatch(captured, /--permission-mode\ndefault/);
+  assert.match(captured, /Use tools \(read_file, grep, list_dir\)/);
+  assert.doesNotMatch(captured, /prefer a single JSON object/);
 });
 
 test("git worktree isolation points --cwd at a real worktree", async () => {
@@ -563,6 +568,33 @@ test("repeated stub after auto-continue stays incompleteReview", async () => {
   assert.match(result.continuationHint ?? "", /new idempotency_key/);
   const count = await readFile(countFile, "utf8");
   assert.equal(count, "2");
+});
+
+test("implementer stub does not auto-continue with the review continuation prompt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-impl-stub-"));
+  const { scriptPath, captureFile, countFile } = await makeSequentialCli(dir, [
+    {
+      text: "I'll start by looking at the current implementation.",
+      sessionId: "sess-impl-stub",
+    },
+  ]);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Implement the feature",
+    mode: "implementer",
+    timeoutMs: 60_000,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.incompleteReview, undefined);
+  const count = await readFile(countFile, "utf8");
+  assert.equal(count, "1");
+  const captured = await readFile(captureFile, "utf8");
+  assert.doesNotMatch(captured, /RESUME_ID=/);
+  assert.doesNotMatch(captured, /prefer a single JSON object/);
+  assert.doesNotMatch(captured, /Do not narrate setup/);
 });
 
 test("timeout with empty text is not treated as a stub and does not auto-continue", async () => {

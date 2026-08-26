@@ -136,15 +136,15 @@ export class GrokHeadlessProvider implements PeerProvider {
 
     const started = Date.now();
     let usedResume = Boolean(resumeId);
+    const parseFindings = prefersParsedFindings(input);
     let result = await this.invokeOnce({
       input: { ...input, cwd },
       timeoutMs,
       resumeId,
       worktreeName: requestedWorktree,
-      allowStructured: true,
     });
 
-    if (shouldAutoContinue(result)) {
+    if (parseFindings && shouldAutoContinue(result)) {
       const remaining = timeoutMs - (Date.now() - started);
       if (remaining < AUTO_CONTINUE_FLOOR_MS) {
         result = withIncompleteHint(result);
@@ -154,7 +154,6 @@ export class GrokHeadlessProvider implements PeerProvider {
           timeoutMs: remaining,
           resumeId: result.nativeSessionId,
           worktreeName: requestedWorktree,
-          allowStructured: true,
         });
         usedResume = true;
         if (result.timedOut || result.cancelled) {
@@ -168,7 +167,7 @@ export class GrokHeadlessProvider implements PeerProvider {
           result = withIncompleteHint(result);
         }
       }
-    } else if (result.incompleteReview) {
+    } else if (parseFindings && result.incompleteReview) {
       result = withIncompleteHint(result);
     }
 
@@ -184,13 +183,10 @@ export class GrokHeadlessProvider implements PeerProvider {
     timeoutMs: number;
     resumeId?: string;
     worktreeName?: string;
-    allowStructured: boolean;
   }): Promise<PeerRunResult> {
     const { input, timeoutMs, resumeId, worktreeName } = options;
     const profile = capabilityProfileForMode(input.mode);
-    const parseFindings =
-      options.allowStructured &&
-      (input.structuredOutput ?? profile.preferParsedFindings);
+    const parseFindings = prefersParsedFindings(input);
     const stream = Boolean(input.streamProgress);
 
     const promptPath = await this.writePromptFile(input.constructedPrompt);
@@ -246,8 +242,12 @@ export class GrokHeadlessProvider implements PeerProvider {
         "Be direct and actionable.",
         "Do not assume you have seen another model's answer.",
         "Use tools (read_file, grep, list_dir) to inspect the repo before answering. Do not end the turn with a plan to inspect.",
-        `When the review is finished, prefer a single JSON object matching ${JSON.stringify(PEER_FINDINGS_JSON_SCHEMA)}. Prose is acceptable. No preamble-only turns, no concatenated objects.`,
       ];
+      if (parseFindings) {
+        rules.push(
+          `When the review is finished, prefer a single JSON object matching ${JSON.stringify(PEER_FINDINGS_JSON_SCHEMA)}. Prose is acceptable. No preamble-only turns, no concatenated objects.`,
+        );
+      }
       if (selfVerify) {
         rules.push(
           "Self-verify findings against the source before answering.",
@@ -450,7 +450,9 @@ export function projectStreamingGrokResult(input: {
         if (pretty) text = pretty;
       }
     }
-    const incomplete = isIncompletePeerReview({ text: rawText, structured });
+    const incomplete =
+      input.expectStructured &&
+      isIncompletePeerReview({ text: rawText, structured });
     return {
       isError: incomplete,
       incompleteReview: incomplete || undefined,
@@ -507,7 +509,9 @@ export function projectGrokResult(input: {
       }
     }
 
-    const incomplete = isIncompletePeerReview({ text: rawText, structured });
+    const incomplete =
+      input.expectStructured &&
+      isIncompletePeerReview({ text: rawText, structured });
     return {
       isError: incomplete,
       incompleteReview: incomplete || undefined,
@@ -547,7 +551,9 @@ export function projectGrokResult(input: {
         if (pretty) text = pretty;
       }
     }
-    const incomplete = isIncompletePeerReview({ text: stdout, structured });
+    const incomplete =
+      input.expectStructured &&
+      isIncompletePeerReview({ text: stdout, structured });
     return {
       isError: incomplete,
       incompleteReview: incomplete || undefined,
@@ -630,6 +636,13 @@ export function isLikelyResumeFailure(result: PeerRunResult): boolean {
     blob.includes("invalid session") ||
     blob.includes("unknown conversation") ||
     blob.includes("invalid conversation")
+  );
+}
+
+function prefersParsedFindings(input: PeerRunInput): boolean {
+  return (
+    input.structuredOutput ??
+    capabilityProfileForMode(input.mode).preferParsedFindings
   );
 }
 

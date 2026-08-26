@@ -121,3 +121,18 @@ test("brace scanner keeps { inside an issue string", () => {
 test("empty unstructured text is incomplete", () => {
   assert.equal(isIncompletePeerReview({ text: "   " }), true);
 });
+
+test("non-string structured summary does not throw and is not an intent stub", () => {
+  assert.equal(
+    isIncompletePeerReview({
+      text: "",
+      structured: {
+        summary: 12,
+        findings: [],
+        residual_risks: [],
+        recommended_next_steps: [],
+      },
+    }),
+    false,
+  );
+});
