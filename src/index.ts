@@ -25,7 +25,7 @@ const CONTEXT_PACKING_PREAMBLE =
   "Before calling: read relevant source files and attach full contents via `files`. Pass complete diffs/logs — never prose summaries. Set `task` with goals, affected behavior, and specific concerns.";
 
 const GROK_SYNC_TIMEOUT_WARNING =
-  "Grok sync may take several minutes. If your MCP client times out under 3 minutes, use the matching *_async tool and poll peer_job_status every 30-60s.";
+  "Grok sync reviews of ordinary diffs usually finish within the 6-minute GROK_TURN_TIMEOUT_MS budget. Use the matching *_async tool and poll peer_job_status every 30-60s when: (1) your MCP client times out under ~3 minutes, (2) the prompt is huge (~80k+ chars / near PEER_AGENTS_MAX_PROMPT_CHARS) or truncated, or (3) risk_level=high or focus=security (maps to --effort high). Sync results may include durationAdvisory in those cases — prefer *_async next time rather than waiting out a host timeout.";
 
 function jsonResult(value: unknown) {
   return {
@@ -51,7 +51,7 @@ async function main() {
 
   server.tool(
     "peer_review_diff",
-    `${CONTEXT_PACKING_PREAMBLE} Route a diff review to the best peer model(s) based on focus and risk. ${GROK_SYNC_TIMEOUT_WARNING}`,
+    `${CONTEXT_PACKING_PREAMBLE} Route a diff review to the best peer model(s) based on focus and risk. Prefer peer_review_diff_async for huge diffs, truncated prompts, risk_level=high, or focus=security. ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       diff: z
         .string()
@@ -392,12 +392,12 @@ async function main() {
 
   server.tool(
     "peer_review_diff_async",
-    `${CONTEXT_PACKING_PREAMBLE} Long-running diff review as a background job (large monorepos). Returns jobId immediately; poll peer_job_status every 30-60s. progress may include textSnippet while running.`,
+    `${CONTEXT_PACKING_PREAMBLE} Long-running Grok diff review as a background job (30 min timeout). Prefer this over peer_review_diff when the review may exceed the client tool timeout, the diff/prompt is huge or truncated, or risk_level=high / focus=security (--effort high). Returns jobId immediately; poll peer_job_status every 30-60s. progress may include textSnippet while running.`,
     {
       diff: z
         .string()
         .describe(
-          "Required. Full unified diff. Prefer this over peer_review_diff when the review may exceed the client tool timeout.",
+          "Required. Full unified diff. Prefer this over peer_review_diff when the review may exceed the client tool timeout, the prompt is huge/truncated, or risk_level=high / focus=security.",
         ),
       repo_path: repoPathSchema,
       focus: focusSchema,

@@ -329,22 +329,36 @@ non-Windows so provider grandchildren do not survive cancellation.
 
 ## Timeout Policy — done
 
-Keep the current synchronous defaults:
+Synchronous Grok turns use `GROK_TURN_TIMEOUT_MS` only (default **360000** / 6
+minutes). Grok does **not** read `PEER_AGENTS_TURN_TIMEOUT_MS`. Operators who
+want the old 120s Grok timeout must set `GROK_TURN_TIMEOUT_MS=120000`.
 
-- Grok: `PEER_AGENTS_TURN_TIMEOUT_MS`, default `120000`
-- Antigravity: `ANTIGRAVITY_TURN_TIMEOUT_MS` or `PEER_AGENTS_TURN_TIMEOUT_MS`,
+- Grok sync: `GROK_TURN_TIMEOUT_MS`, default `360000`
+- Antigravity sync: `ANTIGRAVITY_TURN_TIMEOUT_MS` or `PEER_AGENTS_TURN_TIMEOUT_MS`,
   default `300000`
+- ACP idle (`PEER_AGENTS_GROK_ACP_IDLE_MS`): **between-turns** recycle backstop
+  (`max(configured, grokTurnTimeoutMs+60s)`). In-flight `session/prompt` ignores
+  idle (`promptDepth`). Idle is **not** the job-lifetime mechanism; 30-minute
+  jobs must not depend on idle ≥ 30 min.
 
-Add async-specific defaults:
+Async jobs never inherit a short synchronous timeout by accident:
 
 - `PEER_AGENTS_JOB_TIMEOUT_MS`, default `1800000` (30 minutes)
 - `GROK_JOB_TIMEOUT_MS`, optional provider override
 - `ANTIGRAVITY_JOB_TIMEOUT_MS`, optional provider override
 
-Async jobs never inherit a short synchronous timeout by accident.
-
 Both providers accept the per-call job timeout. For Antigravity, the same
-timeout is also reflected in `--print-timeout`.
+timeout is also reflected in `--print-timeout`. Grok headless sync and async
+both use `--output-format streaming-json`. Grok reviewer turns do **not** pass
+`--json-schema` (that flag aborts the tool loop on 1.0.5).
+
+Intended reviewer/critic/planner permissions (post-stack): `--always-approve`
+with the read-only sandbox. This docs change does not alter those flags.
+
+Callers: ordinary diffs use sync tools. Use `*_async` + `peer_job_status` when
+the host MCP timeout is ≤ ~3 minutes, the prompt is huge/truncated, or
+`risk_level=high` / `focus=security`. Sync results may include additive
+`durationAdvisory`; the server does **not** auto-upgrade sync calls into jobs.
 
 ## Idempotency — done
 

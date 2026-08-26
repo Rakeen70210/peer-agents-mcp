@@ -110,6 +110,7 @@ type TurnResult = {
   incompleteReview?: boolean;
   continuationHint?: string;
   truncatedPrompt?: boolean;
+  durationAdvisory?: string;
 };
 
 type PeerTurnOptions = {
@@ -147,6 +148,7 @@ export type CompareProviderResult = {
   continuationHint?: string;
   structured?: unknown;
   truncatedPrompt?: boolean;
+  durationAdvisory?: string;
 };
 
 export type CompareResult = {
@@ -179,6 +181,7 @@ export type RoutedPeerResult = {
   incompleteReview?: boolean;
   continuationHint?: string;
   truncatedPrompt?: boolean;
+  durationAdvisory?: string;
 };
 
 export type RoutedTaskResult = {
@@ -194,6 +197,7 @@ export type RoutedTaskResult = {
   partialFailure: boolean;
   synthesisHint: string;
   contextAdvisory?: string;
+  durationAdvisory?: string;
 };
 
 const MODE_INSTRUCTIONS: Record<string, string> = {
@@ -537,12 +541,17 @@ export function createApp(options: AppOptions = {}) {
       timedOut?: boolean;
       cancelled?: boolean;
       truncatedPrompt?: boolean;
+      estimatedTokens?: number;
+      riskLevel?: RiskLevel;
+      focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+      autoContinued?: boolean;
     },
   ): TurnResult {
     const isError = flags?.isError ?? peerResult.isError ?? false;
     const timedOut = flags?.timedOut ?? peerResult.timedOut;
     const cancelled = flags?.cancelled ?? peerResult.cancelled;
     const incompleteReview = peerResult.incompleteReview;
+    const truncatedPrompt = flags?.truncatedPrompt ?? peerResult.truncatedPrompt;
     return {
       sessionId: session.id,
       version: session.version,
@@ -567,7 +576,17 @@ export function createApp(options: AppOptions = {}) {
       continuationHint:
         peerResult.continuationHint ??
         continuationHintFor(peerResult, { timedOut, incompleteReview }),
-      truncatedPrompt: flags?.truncatedPrompt ?? peerResult.truncatedPrompt,
+      truncatedPrompt,
+      durationAdvisory:
+        session.provider === "grok"
+          ? durationAdvisoryFor({
+              truncatedPrompt,
+              estimatedTokens: flags?.estimatedTokens,
+              riskLevel: flags?.riskLevel,
+              focus: flags?.focus,
+              autoContinued: flags?.autoContinued,
+            })
+          : undefined,
     };
   }
 
@@ -633,12 +652,24 @@ export function createApp(options: AppOptions = {}) {
       (session.provider === "grok" || session.provider === "antigravity") &&
       hadNative;
 
-    let truncated = false;
+    const finish = (
+      rawPrompt: string,
+      truncated: boolean,
+      peerResult: PeerRunResult,
+      extra?: { isError?: boolean; timedOut?: boolean; cancelled?: boolean },
+    ): TurnResult =>
+      toTurnResult(session, peerResult, {
+        ...extra,
+        truncatedPrompt: truncated,
+        estimatedTokens: estimateContextTokens([rawPrompt]),
+        riskLevel: runOptions?.riskLevel,
+        focus: runOptions?.focus,
+        autoContinued: !hadNative && peerResult.resumed === true,
+      });
+
     if (canResume) {
-      const compact = enforcePromptLimit(
-        buildPrompt(session, input, { nativeResume: true }),
-      );
-      truncated = compact.truncated;
+      const rawPrompt = buildPrompt(session, input, { nativeResume: true });
+      const compact = enforcePromptLimit(rawPrompt);
       const resumed = await invokeProvider(
         session,
         compact.prompt,
@@ -649,37 +680,34 @@ export function createApp(options: AppOptions = {}) {
 
       if (resumed.cancelled || runOptions?.signal?.aborted) {
         await persistNativeSession(session, resumed);
-        return toTurnResult(session, resumed, {
+        return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
           cancelled: true,
-          truncatedPrompt: truncated,
         });
       }
       if (resumed.timedOut || resumed.incompleteReview) {
         await persistNativeSession(session, resumed);
-        return toTurnResult(session, resumed, {
+        return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
           timedOut: resumed.timedOut,
-          truncatedPrompt: truncated,
         });
       }
       if (!resumed.isError) {
         await recordTurn(session, userMessageForTranscript, resumed);
-        return toTurnResult(session, resumed, { truncatedPrompt: truncated });
+        return finish(rawPrompt, compact.truncated, resumed);
       }
       if (!isLikelyResumeFailure(resumed)) {
         await persistNativeSession(session, resumed);
-        return toTurnResult(session, resumed, {
+        return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
-          truncatedPrompt: truncated,
         });
       }
       // Native session lost — fall back to MCP transcript rehydrate.
       session.nativeSessionId = undefined;
     }
 
-    const full = enforcePromptLimit(buildPrompt(session, input));
-    truncated = full.truncated;
+    const rawPrompt = buildPrompt(session, input);
+    const full = enforcePromptLimit(rawPrompt);
     let assignedSessionId: string | undefined;
     if (grokHeadless && !session.nativeSessionId) {
       assignedSessionId = randomUUID();
@@ -697,18 +725,16 @@ export function createApp(options: AppOptions = {}) {
 
     if (peerResult.cancelled || runOptions?.signal?.aborted) {
       await persistNativeSession(session, peerResult);
-      return toTurnResult(session, peerResult, {
+      return finish(rawPrompt, full.truncated, peerResult, {
         isError: true,
         cancelled: true,
-        truncatedPrompt: truncated,
       });
     }
     if (peerResult.timedOut || peerResult.incompleteReview) {
       await persistNativeSession(session, peerResult);
-      return toTurnResult(session, peerResult, {
+      return finish(rawPrompt, full.truncated, peerResult, {
         isError: true,
         timedOut: peerResult.timedOut,
-        truncatedPrompt: truncated,
       });
     }
     if (!peerResult.isError) {
@@ -724,9 +750,8 @@ export function createApp(options: AppOptions = {}) {
       await persistNativeSession(session, peerResult);
     }
 
-    return toTurnResult(session, peerResult, {
+    return finish(rawPrompt, full.truncated, peerResult, {
       isError: peerResult.isError ? true : undefined,
-      truncatedPrompt: truncated,
     });
   }
 
@@ -1149,6 +1174,7 @@ export function createApp(options: AppOptions = {}) {
             incompleteReview: result.incompleteReview,
             continuationHint: result.continuationHint,
             truncatedPrompt: result.truncatedPrompt,
+            durationAdvisory: result.durationAdvisory,
           };
         });
       };
@@ -1172,6 +1198,7 @@ export function createApp(options: AppOptions = {}) {
       const contextWarnings = assessContextQuality(
         contextQualityInputForKind(input.kind, input),
       );
+      const grokRouted = decision.routes.includes("grok");
       const routedResult: RoutedTaskResult = {
         idempotencyKey: input.idempotencyKey,
         taskKind: input.kind,
@@ -1187,6 +1214,15 @@ export function createApp(options: AppOptions = {}) {
           routeResults.some((entry) => !entry.isError),
         synthesisHint: synthesisHint(decision.routes.length),
         contextAdvisory: contextQualityHint(contextWarnings),
+        durationAdvisory: grokRouted
+          ? durationAdvisoryFor({
+              truncatedPrompt: routeResults.some((entry) => entry.truncatedPrompt),
+              estimatedTokens: contextTokensEstimate,
+              riskLevel: input.risk,
+              focus: input.focus,
+              autoContinued: routeResults.some((entry) => entry.durationAdvisory),
+            })
+          : undefined,
       };
 
       await saveComparisonToDir(comparisonsDir, input.idempotencyKey, routedResult);
@@ -1702,6 +1738,7 @@ export function createApp(options: AppOptions = {}) {
             continuationHint: result.continuationHint,
             structured: result.structured,
             truncatedPrompt: result.truncatedPrompt,
+            durationAdvisory: result.durationAdvisory,
           };
         });
       };
@@ -1855,6 +1892,30 @@ function continuationHintFor(
     return `${lead} after ${toolCalls} tool calls. Partial progress attached. Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.`;
   }
   return "Incomplete peer review (intent-only stub). Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.";
+}
+
+const HUGE_PROMPT_TOKEN_THRESHOLD = 20_000;
+
+const GROK_DURATION_ADVISORY =
+  "Grok sync reviews of this size often take 3–6 minutes. If your MCP client times out sooner, use peer_review_diff_async / peer_turn_async and poll peer_job_status.";
+
+function durationAdvisoryFor(input: {
+  truncatedPrompt?: boolean;
+  estimatedTokens?: number;
+  riskLevel?: RiskLevel;
+  focus?: "bugs" | "architecture" | "security" | "tests" | "general";
+  autoContinued?: boolean;
+}): string | undefined {
+  if (
+    input.truncatedPrompt ||
+    (input.estimatedTokens ?? 0) > HUGE_PROMPT_TOKEN_THRESHOLD ||
+    input.riskLevel === "high" ||
+    input.focus === "security" ||
+    input.autoContinued
+  ) {
+    return GROK_DURATION_ADVISORY;
+  }
+  return undefined;
 }
 
 const SECRET_PATTERNS = [

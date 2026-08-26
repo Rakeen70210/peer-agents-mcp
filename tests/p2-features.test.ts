@@ -137,6 +137,10 @@ test("enforcePromptLimit prepends truncation marker and stays within cap", async
   assert.equal(prompt.split("\n")[0].includes("read_file"), true);
   assert.ok(prompt.length <= 400);
   assert.equal(result.truncatedPrompt, true);
+  assert.equal(
+    result.durationAdvisory,
+    "Grok sync reviews of this size often take 3–6 minutes. If your MCP client times out sooner, use peer_review_diff_async / peer_turn_async and poll peer_job_status.",
+  );
 
   const shortApp = createApp({
     storageDir: await mkdtemp(join(tmpdir(), "peer-trunc-short-")),

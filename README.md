@@ -48,6 +48,29 @@ Additional session tools: `peer_summarize`, `peer_transcript`, `peer_list_sessio
 
 All routed tools accept full file contents via the `files` parameter and diffs via `diff`. Never send summaries — send the actual content.
 
+## When to use sync vs async
+
+Grok sync reviews of ordinary diffs typically take **3–6 minutes**. The Grok child timeout is `GROK_TURN_TIMEOUT_MS` (default 6 minutes). Raising the **child** timeout does **not** raise the **host** MCP client wait. If the host gives up first, Codex never sees `durationAdvisory` / `continuationHint` / `nativeSessionId` in that tool response — use `*_async`.
+
+The server does **not** silently convert sync tools into jobs.
+
+| Use sync (`peer_review_diff`, `peer_plan`, `peer_turn`, …) | Use async (`*_async` + `peer_job_status`) |
+| --- | --- |
+| Ordinary diffs / plans that fit in ~80k prompt chars | Prompt near `PEER_AGENTS_MAX_PROMPT_CHARS` (120k) or truncated |
+| Default / medium risk | `risk_level=high` or `focus=security` (`--effort high`) |
+| Follow-up “re-check this one file” | Implementation handoff (`peer_implement_async`) |
+| Host can wait ~6 minutes | Host MCP timeout ≤ 2–3 minutes; huge logs; multi-attempt debug |
+
+Sync Grok/routed results may include additive `durationAdvisory` when the prompt was truncated, estimated tokens exceed ~20k (~80k chars), `risk_level=high` / `focus=security`, or a stub auto-continue was consumed. Example:
+
+```json
+{
+  "durationAdvisory": "Grok sync reviews of this size often take 3–6 minutes. If your MCP client times out sooner, use peer_review_diff_async / peer_turn_async and poll peer_job_status."
+}
+```
+
+A truncated `peer_review_diff` still runs synchronously (tools-against-cwd instruction is prepended). Prefer `peer_review_diff_async` next time; do not treat truncation as a hard reject.
+
 ## Long-running async jobs
 
 Large implementation handoffs can exceed the MCP client's synchronous tool timeout. Use the async path instead of blocking on `peer_turn`:
@@ -74,7 +97,7 @@ Async jobs use a separate timeout from synchronous turns:
 - `PEER_AGENTS_JOB_GC_MAX_AGE_MS` — terminal job retention (default 7 days)
 - `PEER_AGENTS_GROK_TRANSPORT` — `headless` (default) or `acp` for warm process pool
 - `PEER_AGENTS_GROK_ACP_MAX_CLIENTS` — max concurrent ACP processes (default 4)
-- `PEER_AGENTS_GROK_ACP_IDLE_MS` — idle recycle for ACP processes (default 5 minutes)
+- `PEER_AGENTS_GROK_ACP_IDLE_MS` — ACP **between-turns** idle recycle (default `max(5 min, GROK_TURN_TIMEOUT_MS + 60s)`). Idle is **not** the job lifetime; in-flight `session/prompt` ignores it.
 
 Keep the MCP server process alive for the duration of a job.
 
@@ -84,7 +107,7 @@ Keep the MCP server process alive for the duration of a job.
 |--|----------------------|-------|
 | Invocation | `grok --prompt-file` each turn | Long-lived `grok agent stdio` per cwd |
 | Latency | Cold start every turn | Warm process; multi-turn reuses process + session |
-| CLI features | Full flag matrix (sandbox, json-schema, worktree, …) | Subset (always-approve); structured findings via prompt |
+| CLI features | Sandbox, worktree, minted `--session-id`; **no** `--json-schema` on the tool loop; always `--output-format streaming-json` | Subset (`--always-approve`); structured findings via prompt. Idle is a between-turns backstop, not job lifetime. |
 | Enable | *(default)* | `PEER_AGENTS_GROK_TRANSPORT=acp` |
 
 Prefer **headless** for one-shot reviews with strict sandboxing. Prefer **acp** when you run many follow-up `peer_turn`s and want lower process-startup cost.
@@ -155,13 +178,13 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
 - `PEER_AGENTS_ENABLED_PROVIDERS` — comma list whitelist of peer CLIs (`grok`, `antigravity`). Use `antigravity` alone when the host is Grok so peers never re-enter Grok.
 - `PEER_AGENTS_DISABLED_PROVIDERS` — comma list blacklist (ignored if `PEER_AGENTS_ENABLED_PROVIDERS` is set)
-- `GROK_TURN_TIMEOUT_MS` — Grok sync timeout for headless and ACP (default 6 minutes / 360000ms). Grok does **not** read `PEER_AGENTS_TURN_TIMEOUT_MS`.
-- `PEER_AGENTS_TURN_TIMEOUT_MS` — Antigravity sync fallback only (default 300s). Does not pin Grok. Operators who want the old 120s Grok timeout must set `GROK_TURN_TIMEOUT_MS=120000`.
-- `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override
-- `PEER_AGENTS_GROK_ACP_IDLE_MS` — ACP between-turns idle recycle (default max(5 min, Grok turn timeout + 60s)). In-flight `session/prompt` ignores idle.
+- `GROK_TURN_TIMEOUT_MS` — Grok sync timeout for headless and ACP (default **6 minutes** / `360000`). **Only** source besides per-call `timeoutMs`. Grok does **not** read `PEER_AGENTS_TURN_TIMEOUT_MS`.
+- `PEER_AGENTS_TURN_TIMEOUT_MS` — Antigravity sync fallback only (default 300s). **Does not pin Grok.** Unset it or set `GROK_TURN_TIMEOUT_MS` explicitly. Operators who want the old 120s Grok timeout must set `GROK_TURN_TIMEOUT_MS=120000`.
+- `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override (default 300s)
+- `PEER_AGENTS_GROK_ACP_IDLE_MS` — ACP **between-turns** idle recycle (default `max(5 min, GROK_TURN_TIMEOUT_MS + 60s)`). In-flight `session/prompt` ignores idle (`promptDepth`). **Not** the 30-minute job lifetime.
 - `PEER_AGENTS_JOB_TIMEOUT_MS` — async job timeout (default 30 minutes)
 - `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional async per-provider overrides
-- `PEER_AGENTS_MAX_PROMPT_CHARS` — safety limit on prompt size
+- `PEER_AGENTS_MAX_PROMPT_CHARS` — safety limit on prompt size (default 120000); truncation prepends a tools-against-cwd instruction and continues the sync turn
 
 ## Multi-turn peer sessions
 
@@ -186,12 +209,13 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | Reviewer / critic | `--sandbox read-only`, `--always-approve`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
 | Planner | `--sandbox read-only`, `--permission-mode plan`, `--always-approve` |
 | Implementer | `--sandbox workspace`, `--always-approve` |
+| Permissions (intended end state) | Reviewer/critic/planner use `--always-approve` (reviewer **never** `--permission-mode default`) so a non-TTY MCP child does not wait on a click. Keep the read-only sandbox, `--disallowed-tools search_replace,write`, and `--deny` destructive bash. Lands with the permissions PR; not the flags on this branch. |
 | `peer_implement_async` | Default git worktree isolation via `git worktree add` + `--cwd` (`use_worktree: false` to opt out). Grok 1.0 headless ignores `--worktree`. |
-| Review findings | Best-effort parse of findings JSON from final text; prose is a valid review. Grok headless does not pass `--json-schema`. |
-| Risk / security | Elevated `--effort`; extra self-verify `--rules` (Grok 1.0 removed `--check`) |
+| Review findings | Best-effort parse of findings JSON from final text; prose is a valid review. Grok headless does **not** pass `--json-schema` (that flag aborts the tool loop on 1.0.5). |
+| Risk / security | Elevated `--effort`; extra self-verify `--rules` (Grok 1.0 removed `--check`). High effort is a reason for `durationAdvisory` / `*_async`, not for dropping `--effort high`. |
 | Specialists | Packaged `--agent` for security review / architecture planning |
-| Sync + async output | Always `--output-format streaming-json` (json-envelope fallback if the CLI still emits one object). `progress` on `peer_job_status`. |
-| ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse. Idle is a between-turns backstop; in-flight prompts ignore it. |
+| Sync + async output | Always `--output-format streaming-json` on Grok headless (json-envelope fallback if the CLI still emits one object). `progress` on `peer_job_status`. |
+| ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse. Idle is a **between-turns** backstop, not job lifetime; in-flight `session/prompt` ignores it. |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
 
 ## Antigravity CLI integration (agy 1.1.8+)
