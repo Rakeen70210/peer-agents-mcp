@@ -209,7 +209,7 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | Reviewer / critic | `--sandbox read-only`, `--always-approve`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
 | Planner | `--sandbox read-only`, `--permission-mode plan`, `--always-approve` |
 | Implementer | `--sandbox workspace`, `--always-approve` |
-| Permissions (intended end state) | Reviewer/critic/planner use `--always-approve` (reviewer **never** `--permission-mode default`) so a non-TTY MCP child does not wait on a click. Keep the read-only sandbox, `--disallowed-tools search_replace,write`, and `--deny` destructive bash. Lands with the permissions PR; not the flags on this branch. |
+| Permissions | Reviewer/critic/planner use `--always-approve` (reviewer **never** `--permission-mode default`) so a non-TTY MCP child does not wait on a click. Keep the read-only sandbox, `--disallowed-tools search_replace,write`, and `--deny` destructive bash. |
 | `peer_implement_async` | Default git worktree isolation via `git worktree add` + `--cwd` (`use_worktree: false` to opt out). Grok 1.0 headless ignores `--worktree`. |
 | Review findings | Best-effort parse of findings JSON from final text; prose is a valid review. Grok headless does **not** pass `--json-schema` (that flag aborts the tool loop on 1.0.5). |
 | Risk / security | Elevated `--effort`; extra self-verify `--rules` (Grok 1.0 removed `--check`). High effort is a reason for `durationAdvisory` / `*_async`, not for dropping `--effort high`. |
