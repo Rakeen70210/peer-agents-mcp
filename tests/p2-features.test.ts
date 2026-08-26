@@ -55,6 +55,130 @@ test("stream accumulator builds text and progress from NDJSON events", () => {
   assert.equal(projected.metrics?.numTurns, 4);
 });
 
+test("streaming stub is incompleteReview not success", () => {
+  const acc = createStreamAccumulator();
+  acc.onLine(
+    JSON.stringify({
+      type: "text",
+      data: "I'll inspect the full prompt, remediation plan, and current source/release contracts first…",
+    }),
+  );
+  acc.onLine(
+    JSON.stringify({
+      type: "end",
+      stopReason: "EndTurn",
+      sessionId: "s-stub",
+      num_turns: 1,
+    }),
+  );
+  const projected = projectStreamingGrokResult({
+    streamState: acc,
+    stdout: "streamed",
+    stderr: "",
+    exitCode: 0,
+    expectStructured: true,
+  });
+  assert.equal(projected.isError, true);
+  assert.equal(projected.incompleteReview, true);
+  assert.equal(projected.nativeSessionId, "s-stub");
+});
+
+test("enforcePromptLimit prepends truncation marker and stays within cap", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-trunc-"));
+  const prompts: string[] = [];
+  const app = createApp({
+    storageDir,
+    maxPromptChars: 400,
+    providers: {
+      grok: {
+        name: "grok",
+        healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+        runTurn: async (input) => {
+          prompts.push(input.constructedPrompt);
+          return {
+            isError: false,
+            text: "ok",
+            stdout: "ok",
+            stderr: "",
+            nativeSessionId: "n-trunc",
+          };
+        },
+      },
+      antigravity: {
+        name: "antigravity",
+        healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+        runTurn: async () => ({
+          isError: false,
+          text: "n/a",
+          stdout: "",
+          stderr: "",
+        }),
+      },
+    },
+  });
+  await app.hydrate();
+  const started = await app.start({
+    provider: "grok",
+    task: "review",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  const result = await app.turn({
+    sessionId: started.sessionId,
+    message: "x".repeat(5000),
+    idempotencyKey: "trunc-1",
+  });
+  assert.equal(prompts.length, 1);
+  const prompt = prompts[0];
+  assert.ok(prompt.startsWith("[TRUNCATED:"));
+  assert.equal(prompt.split("\n")[0].includes("read_file"), true);
+  assert.ok(prompt.length <= 400);
+  assert.equal(result.truncatedPrompt, true);
+
+  const shortApp = createApp({
+    storageDir: await mkdtemp(join(tmpdir(), "peer-trunc-short-")),
+    maxPromptChars: 20_000,
+    providers: {
+      grok: {
+        name: "grok",
+        healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+        runTurn: async (input) => {
+          prompts.push(input.constructedPrompt);
+          return {
+            isError: false,
+            text: "ok",
+            stdout: "ok",
+            stderr: "",
+          };
+        },
+      },
+      antigravity: {
+        name: "antigravity",
+        healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+        runTurn: async () => ({
+          isError: false,
+          text: "n/a",
+          stdout: "",
+          stderr: "",
+        }),
+      },
+    },
+  });
+  await shortApp.hydrate();
+  const shortStarted = await shortApp.start({
+    provider: "grok",
+    task: "review-short",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  await shortApp.turn({
+    sessionId: shortStarted.sessionId,
+    message: "hello",
+    idempotencyKey: "trunc-2",
+  });
+  assert.doesNotMatch(prompts.at(-1) ?? "", /\[TRUNCATED:/);
+});
+
 test("grok streamProgress uses streaming-json and reports progress", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-stream-"));
   const captureFile = join(dir, "args.txt");

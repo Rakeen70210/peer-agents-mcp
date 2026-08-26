@@ -1,6 +1,7 @@
 /**
  * JSON Schema for structured peer review / debug / verify findings.
- * Used with Grok `--json-schema` so host agents can act on findings machine-readably.
+ * Grok headless does not pass `--json-schema` (it aborts the tool loop on 1.0.5);
+ * this shape is the preferred last-object parse target and Agy `--json-schema`.
  */
 export const PEER_FINDINGS_JSON_SCHEMA = {
   type: "object",

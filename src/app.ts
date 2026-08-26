@@ -102,6 +102,10 @@ type TurnResult = {
   metrics?: PeerRunMetrics;
   structured?: unknown;
   worktreeName?: string;
+  progress?: PeerRunProgress;
+  incompleteReview?: boolean;
+  continuationHint?: string;
+  truncatedPrompt?: boolean;
 };
 
 type PeerTurnOptions = {
@@ -132,6 +136,12 @@ export type CompareProviderResult = {
   stateSummary: string;
   nativeSessionId?: string;
   isError: boolean;
+  timedOut?: boolean;
+  progress?: PeerRunProgress;
+  incompleteReview?: boolean;
+  continuationHint?: string;
+  structured?: unknown;
+  truncatedPrompt?: boolean;
 };
 
 export type CompareResult = {
@@ -154,10 +164,15 @@ export type RoutedPeerResult = {
   stateSummary: string;
   nativeSessionId?: string;
   isError: boolean;
+  timedOut?: boolean;
   resumed?: boolean;
   metrics?: PeerRunMetrics;
   structured?: unknown;
   worktreeName?: string;
+  progress?: PeerRunProgress;
+  incompleteReview?: boolean;
+  continuationHint?: string;
+  truncatedPrompt?: boolean;
 };
 
 export type RoutedTaskResult = {
@@ -511,26 +526,53 @@ export function createApp(options: AppOptions = {}) {
   function toTurnResult(
     session: Session,
     peerResult: PeerRunResult,
-    flags?: { isError?: boolean; timedOut?: boolean; cancelled?: boolean },
+    flags?: {
+      isError?: boolean;
+      timedOut?: boolean;
+      cancelled?: boolean;
+      truncatedPrompt?: boolean;
+    },
   ): TurnResult {
+    const isError = flags?.isError ?? peerResult.isError ?? false;
+    const timedOut = flags?.timedOut ?? peerResult.timedOut;
+    const cancelled = flags?.cancelled ?? peerResult.cancelled;
+    const incompleteReview = peerResult.incompleteReview;
     return {
       sessionId: session.id,
       version: session.version,
-      response:
-        flags?.cancelled || flags?.timedOut || flags?.isError
-          ? peerResult.stderr || peerResult.text || "Error"
-          : peerResult.text,
+      response: formatTurnResponse(peerResult, {
+        isError,
+        timedOut,
+        cancelled,
+        incompleteReview,
+      }),
       stateSummary: stateSummary(session),
       nativeSessionId:
         peerResult.nativeSessionId ?? session.nativeSessionId ?? undefined,
-      isError: flags?.isError ?? peerResult.isError ?? false,
-      timedOut: flags?.timedOut,
-      cancelled: flags?.cancelled,
+      isError,
+      timedOut,
+      cancelled,
       resumed: peerResult.resumed,
       metrics: peerResult.metrics,
       structured: peerResult.structured,
       worktreeName: peerResult.worktreeName ?? session.worktreeName,
+      progress: peerResult.progress,
+      incompleteReview,
+      continuationHint:
+        peerResult.continuationHint ??
+        continuationHintFor(peerResult, { timedOut, incompleteReview }),
+      truncatedPrompt: flags?.truncatedPrompt ?? peerResult.truncatedPrompt,
     };
+  }
+
+  async function persistNativeSession(
+    session: Session,
+    peerResult: PeerRunResult,
+  ): Promise<void> {
+    if (!peerResult.nativeSessionId) return;
+    if (session.nativeSessionId === peerResult.nativeSessionId) return;
+    session.nativeSessionId = peerResult.nativeSessionId;
+    await persist(session);
   }
 
   async function invokeProvider(
@@ -575,57 +617,75 @@ export function createApp(options: AppOptions = {}) {
       (session.provider === "grok" || session.provider === "antigravity") &&
       Boolean(session.nativeSessionId);
 
+    let truncated = false;
     if (canResume) {
       const compact = enforcePromptLimit(
         buildPrompt(session, input, { nativeResume: true }),
       );
+      truncated = compact.truncated;
       const resumed = await invokeProvider(
         session,
-        compact,
+        compact.prompt,
         input.files,
         runOptions,
         session.nativeSessionId,
       );
 
       if (resumed.cancelled || runOptions?.signal?.aborted) {
+        await persistNativeSession(session, resumed);
         return toTurnResult(session, resumed, {
           isError: true,
           cancelled: true,
+          truncatedPrompt: truncated,
         });
       }
-      if (resumed.timedOut) {
-        return toTurnResult(session, resumed, { isError: true, timedOut: true });
+      if (resumed.timedOut || resumed.incompleteReview) {
+        await persistNativeSession(session, resumed);
+        return toTurnResult(session, resumed, {
+          isError: true,
+          timedOut: resumed.timedOut,
+          truncatedPrompt: truncated,
+        });
       }
       if (!resumed.isError) {
         await recordTurn(session, userMessageForTranscript, resumed);
-        return toTurnResult(session, resumed);
+        return toTurnResult(session, resumed, { truncatedPrompt: truncated });
       }
       if (!isLikelyResumeFailure(resumed)) {
-        return toTurnResult(session, resumed, { isError: true });
+        await persistNativeSession(session, resumed);
+        return toTurnResult(session, resumed, {
+          isError: true,
+          truncatedPrompt: truncated,
+        });
       }
       // Native session lost — fall back to MCP transcript rehydrate.
       session.nativeSessionId = undefined;
     }
 
     const full = enforcePromptLimit(buildPrompt(session, input));
+    truncated = full.truncated;
     const peerResult = await invokeProvider(
       session,
-      full,
+      full.prompt,
       input.files,
       runOptions,
       undefined,
     );
 
     if (peerResult.cancelled || runOptions?.signal?.aborted) {
+      await persistNativeSession(session, peerResult);
       return toTurnResult(session, peerResult, {
         isError: true,
         cancelled: true,
+        truncatedPrompt: truncated,
       });
     }
-    if (peerResult.timedOut) {
+    if (peerResult.timedOut || peerResult.incompleteReview) {
+      await persistNativeSession(session, peerResult);
       return toTurnResult(session, peerResult, {
         isError: true,
-        timedOut: true,
+        timedOut: peerResult.timedOut,
+        truncatedPrompt: truncated,
       });
     }
     if (!peerResult.isError) {
@@ -633,17 +693,25 @@ export function createApp(options: AppOptions = {}) {
         session.worktreeName = peerResult.worktreeName;
       }
       await recordTurn(session, userMessageForTranscript, peerResult);
+    } else {
+      await persistNativeSession(session, peerResult);
     }
 
     return toTurnResult(session, peerResult, {
       isError: peerResult.isError ? true : undefined,
+      truncatedPrompt: truncated,
     });
   }
 
-  function enforcePromptLimit(prompt: string): string {
-    if (prompt.length <= maxPromptChars) return prompt;
-    const marker = "\n\n[TRUNCATED: prompt exceeded PEER_AGENTS_MAX_PROMPT_CHARS]\n";
-    return prompt.slice(0, maxPromptChars - marker.length) + marker;
+  function enforcePromptLimit(prompt: string): { prompt: string; truncated: boolean } {
+    if (prompt.length <= maxPromptChars) return { prompt, truncated: false };
+    const marker =
+      "[TRUNCATED: prompt exceeded PEER_AGENTS_MAX_PROMPT_CHARS. The body below is incomplete. Use tools (read_file, grep, list_dir) against the repo cwd to read remaining evidence. Do not claim files you did not open.]\n\n";
+    if (marker.length >= maxPromptChars) {
+      return { prompt: marker.slice(0, maxPromptChars), truncated: true };
+    }
+    const body = prompt.slice(0, Math.max(0, maxPromptChars - marker.length));
+    return { prompt: marker + body, truncated: true };
   }
 
   function syntheticSucceededJob(
@@ -1042,10 +1110,15 @@ export function createApp(options: AppOptions = {}) {
             stateSummary: result.stateSummary,
             nativeSessionId: result.nativeSessionId,
             isError: result.isError ?? false,
+            timedOut: result.timedOut,
             resumed: result.resumed,
             metrics: result.metrics,
             structured: result.structured,
             worktreeName: result.worktreeName,
+            progress: result.progress,
+            incompleteReview: result.incompleteReview,
+            continuationHint: result.continuationHint,
+            truncatedPrompt: result.truncatedPrompt,
           };
         });
       };
@@ -1576,6 +1649,12 @@ export function createApp(options: AppOptions = {}) {
             stateSummary: result.stateSummary,
             nativeSessionId: result.nativeSessionId,
             isError: result.isError ?? false,
+            timedOut: result.timedOut,
+            progress: result.progress,
+            incompleteReview: result.incompleteReview,
+            continuationHint: result.continuationHint,
+            structured: result.structured,
+            truncatedPrompt: result.truncatedPrompt,
           };
         });
       };
@@ -1691,6 +1770,42 @@ export function createApp(options: AppOptions = {}) {
   };
 
   return app;
+}
+
+function formatTurnResponse(
+  peerResult: PeerRunResult,
+  flags: {
+    isError?: boolean;
+    timedOut?: boolean;
+    cancelled?: boolean;
+    incompleteReview?: boolean;
+  },
+): string {
+  const isProblem = Boolean(flags.cancelled || flags.timedOut || flags.isError);
+  if (!isProblem) return peerResult.text;
+  const headline = flags.cancelled
+    ? peerResult.stderr || "Grok cancelled"
+    : flags.timedOut
+      ? peerResult.stderr || "Grok timed out"
+      : flags.incompleteReview
+        ? peerResult.stderr || "Incomplete peer review"
+        : peerResult.stderr || "Error";
+  const partial = peerResult.text.trim();
+  if (partial && partial !== headline) {
+    return `${headline}\n\n${partial}`;
+  }
+  return headline || "Error";
+}
+
+function continuationHintFor(
+  peerResult: PeerRunResult,
+  flags: { timedOut?: boolean; incompleteReview?: boolean },
+): string | undefined {
+  if (!flags.timedOut && !flags.incompleteReview) return undefined;
+  const lead = flags.timedOut
+    ? peerResult.stderr || "Grok timed out"
+    : "Incomplete peer review (intent-only stub).";
+  return `${lead} Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.`;
 }
 
 const SECRET_PATTERNS = [

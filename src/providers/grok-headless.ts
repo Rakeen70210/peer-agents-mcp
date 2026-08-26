@@ -15,6 +15,11 @@ import {
 } from "./grok-worktree.js";
 export { sanitizeWorktreeName };
 import {
+  CONTINUATION_PROMPT,
+  isIncompletePeerReview,
+  lastFindingsObject,
+} from "./grok-review-quality.js";
+import {
   formatStructuredAsText,
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
@@ -31,6 +36,8 @@ import type {
   PeerRunProgress,
   PeerRunResult,
 } from "./types.js";
+
+const AUTO_CONTINUE_FLOOR_MS = 30_000;
 
 type GrokJsonResponse = {
   text?: string;
@@ -127,7 +134,9 @@ export class GrokHeadlessProvider implements PeerProvider {
       if (isolated) cwd = isolated;
     }
 
-    const result = await this.invokeOnce({
+    const started = Date.now();
+    let usedResume = Boolean(resumeId);
+    let result = await this.invokeOnce({
       input: { ...input, cwd },
       timeoutMs,
       resumeId,
@@ -135,9 +144,37 @@ export class GrokHeadlessProvider implements PeerProvider {
       allowStructured: true,
     });
 
+    if (shouldAutoContinue(result)) {
+      const remaining = timeoutMs - (Date.now() - started);
+      if (remaining < AUTO_CONTINUE_FLOOR_MS) {
+        result = withIncompleteHint(result);
+      } else {
+        result = await this.invokeOnce({
+          input: { ...input, cwd, constructedPrompt: CONTINUATION_PROMPT },
+          timeoutMs: remaining,
+          resumeId: result.nativeSessionId,
+          worktreeName: requestedWorktree,
+          allowStructured: true,
+        });
+        usedResume = true;
+        if (result.timedOut || result.cancelled) {
+          return {
+            ...result,
+            resumed: false,
+            worktreeName: result.worktreeName ?? requestedWorktree,
+          };
+        }
+        if (isIncompletePeerReview(result)) {
+          result = withIncompleteHint(result);
+        }
+      }
+    } else if (result.incompleteReview) {
+      result = withIncompleteHint(result);
+    }
+
     return {
       ...result,
-      resumed: Boolean(resumeId) && !result.isError,
+      resumed: usedResume && !result.isError,
       worktreeName: result.worktreeName ?? requestedWorktree,
     };
   }
@@ -151,9 +188,9 @@ export class GrokHeadlessProvider implements PeerProvider {
   }): Promise<PeerRunResult> {
     const { input, timeoutMs, resumeId, worktreeName } = options;
     const profile = capabilityProfileForMode(input.mode);
-    const useStructured =
+    const parseFindings =
       options.allowStructured &&
-      (input.structuredOutput ?? profile.preferStructuredOutput);
+      (input.structuredOutput ?? profile.preferParsedFindings);
     const stream = Boolean(input.streamProgress);
 
     const promptPath = await this.writePromptFile(input.constructedPrompt);
@@ -203,15 +240,13 @@ export class GrokHeadlessProvider implements PeerProvider {
         args.push("--agent", agentPath);
       }
 
-      if (useStructured) {
-        args.push("--json-schema", JSON.stringify(PEER_FINDINGS_JSON_SCHEMA));
-      }
-
       // Extra rules for peer independence / role.
       const rules = [
         "You are a peer agent consulted by another coding agent.",
         "Be direct and actionable.",
         "Do not assume you have seen another model's answer.",
+        "Use tools (read_file, grep, list_dir) to inspect the repo before answering. Do not end the turn with a plan to inspect.",
+        `When the review is finished, prefer a single JSON object matching ${JSON.stringify(PEER_FINDINGS_JSON_SCHEMA)}. Prose is acceptable. No preamble-only turns, no concatenated objects.`,
       ];
       if (selfVerify) {
         rules.push(
@@ -242,6 +277,7 @@ export class GrokHeadlessProvider implements PeerProvider {
           stdout: result.stdout,
           stderr: "Grok cancelled",
           cancelled: true,
+          nativeSessionId: resumeId,
           worktreeName,
           progress: streamState?.progress(),
         };
@@ -254,6 +290,7 @@ export class GrokHeadlessProvider implements PeerProvider {
           stdout: result.stdout,
           stderr: `Grok timed out after ${timeoutMs}ms`,
           timedOut: true,
+          nativeSessionId: resumeId,
           worktreeName,
           progress: streamState?.progress(),
         };
@@ -266,7 +303,7 @@ export class GrokHeadlessProvider implements PeerProvider {
           stderr: result.stderr,
           exitCode: result.exitCode,
           worktreeName,
-          expectStructured: useStructured,
+          expectStructured: parseFindings,
         });
       }
 
@@ -275,7 +312,7 @@ export class GrokHeadlessProvider implements PeerProvider {
         stderr: result.stderr,
         exitCode: result.exitCode,
         worktreeName,
-        expectStructured: useStructured,
+        expectStructured: parseFindings,
       });
     } finally {
       await rm(promptPath, { force: true }).catch(() => undefined);
@@ -407,14 +444,16 @@ export function projectStreamingGrokResult(input: {
     let structured: unknown;
     let text = rawText;
     if (input.expectStructured) {
-      structured = tryParseStructured(rawText);
+      structured = lastFindingsObject(rawText);
       if (structured) {
         const pretty = formatStructuredAsText(structured);
         if (pretty) text = pretty;
       }
     }
+    const incomplete = isIncompletePeerReview({ text: rawText, structured });
     return {
-      isError: false,
+      isError: incomplete,
+      incompleteReview: incomplete || undefined,
       text,
       stdout: input.stdout,
       stderr: input.stderr,
@@ -461,15 +500,17 @@ export function projectGrokResult(input: {
     let text = rawText;
 
     if (input.expectStructured) {
-      structured = tryParseStructured(rawText);
+      structured = lastFindingsObject(rawText);
       if (structured) {
         const pretty = formatStructuredAsText(structured);
         if (pretty) text = pretty;
       }
     }
 
+    const incomplete = isIncompletePeerReview({ text: rawText, structured });
     return {
-      isError: false,
+      isError: incomplete,
+      incompleteReview: incomplete || undefined,
       text,
       stdout,
       stderr: input.stderr,
@@ -497,12 +538,24 @@ export function projectGrokResult(input: {
   }
 
   if (input.exitCode === 0 && stdout) {
+    let structured: unknown;
+    let text = stdout;
+    if (input.expectStructured) {
+      structured = lastFindingsObject(stdout);
+      if (structured) {
+        const pretty = formatStructuredAsText(structured);
+        if (pretty) text = pretty;
+      }
+    }
+    const incomplete = isIncompletePeerReview({ text: stdout, structured });
     return {
-      isError: false,
-      text: stdout,
+      isError: incomplete,
+      incompleteReview: incomplete || undefined,
+      text,
       stdout,
       stderr: input.stderr,
       metrics,
+      structured,
       worktreeName: input.worktreeName,
     };
   }
@@ -562,7 +615,9 @@ function resolveWorktreeName(input: PeerRunInput): string | undefined {
 
 /** Heuristic for app-level resume fallback (rebuild full prompt, cold start). */
 export function isLikelyResumeFailure(result: PeerRunResult): boolean {
-  if (!result.isError || result.timedOut || result.cancelled) return false;
+  if (!result.isError || result.timedOut || result.cancelled || result.incompleteReview) {
+    return false;
+  }
   const blob = `${result.text}\n${result.stderr}\n${result.stdout}`.toLowerCase();
   return (
     blob.includes("resume") ||
@@ -578,21 +633,24 @@ export function isLikelyResumeFailure(result: PeerRunResult): boolean {
   );
 }
 
-function tryParseStructured(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed) return undefined;
-  // Direct JSON object
-  if (trimmed.startsWith("{")) {
-    const parsed = safeJsonParse<unknown>(trimmed);
-    if (parsed && typeof parsed === "object") return parsed;
-  }
-  // Fenced block
-  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence?.[1]) {
-    const parsed = safeJsonParse<unknown>(fence[1].trim());
-    if (parsed && typeof parsed === "object") return parsed;
-  }
-  return undefined;
+function shouldAutoContinue(result: PeerRunResult): boolean {
+  return (
+    !result.timedOut &&
+    !result.cancelled &&
+    Boolean(result.nativeSessionId) &&
+    isIncompletePeerReview(result)
+  );
+}
+
+function withIncompleteHint(result: PeerRunResult): PeerRunResult {
+  return {
+    ...result,
+    isError: true,
+    incompleteReview: true,
+    continuationHint:
+      result.continuationHint ??
+      "Incomplete peer review (intent-only stub). Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.",
+  };
 }
 
 function stripModelArgs(args: string[]): string[] {

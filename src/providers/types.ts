@@ -61,8 +61,9 @@ export type PeerRunInput = {
    */
   worktree?: boolean | string;
   /**
-   * Request structured JSON findings (`--json-schema`).
-   * Default: true for reviewer/critic when not resuming implementer work.
+   * Prefer parsing findings JSON from the model's final text when present.
+   * Grok headless does not pass `--json-schema` (that flag aborts the tool loop on 1.0.5).
+   * Default: true for reviewer/critic.
    */
   structuredOutput?: boolean;
   /** Extra self-verify instruction in `--rules` (Grok `--check` was removed in 1.0). */
@@ -99,12 +100,18 @@ export type PeerRunResult = {
   /** True when this turn resumed a native CLI session. */
   resumed?: boolean;
   metrics?: PeerRunMetrics;
-  /** Parsed structured findings when `--json-schema` was used. */
+  /** Parsed structured findings when a findings JSON object is present in the text. */
   structured?: unknown;
   /** Worktree name passed to Grok when isolation was requested. */
   worktreeName?: string;
   /** Last progress snapshot when streamProgress was enabled. */
   progress?: PeerRunProgress;
+  /** True when the turn ended as an intent-only stub rather than a finished review. */
+  incompleteReview?: boolean;
+  /** How the host should continue after timeout or an incomplete stub. */
+  continuationHint?: string;
+  /** True when the app truncated the constructed prompt before spawn. */
+  truncatedPrompt?: boolean;
 };
 
 export interface PeerProvider {

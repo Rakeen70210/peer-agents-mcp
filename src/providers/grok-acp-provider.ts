@@ -3,6 +3,7 @@ import {
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
 import { capabilityProfileForMode } from "./grok-profiles.js";
+import { lastFindingsObject } from "./grok-review-quality.js";
 import { getSharedGrokAcpPool, type GrokAcpPool } from "./grok-acp-pool.js";
 import { parsePositiveInt } from "./runner.js";
 import type { PeerProvider, PeerRunInput, PeerRunResult } from "./types.js";
@@ -58,7 +59,7 @@ export class GrokAcpProvider implements PeerProvider {
     const cwd = input.cwd ?? process.cwd();
     const profile = capabilityProfileForMode(input.mode);
     const wantStructured =
-      input.structuredOutput ?? profile.preferStructuredOutput;
+      input.structuredOutput ?? profile.preferParsedFindings;
 
     // Annotate prompt with peer constraints that headless flags used to enforce.
     const prompt = buildAcpPrompt(input.constructedPrompt, {
@@ -145,7 +146,7 @@ export class GrokAcpProvider implements PeerProvider {
       let text = result.text;
       let structured: unknown;
       if (wantStructured) {
-        structured = tryParseJsonObject(text);
+        structured = lastFindingsObject(text);
         if (structured) {
           const pretty = formatStructuredAsText(structured);
           if (pretty) text = pretty;
@@ -202,22 +203,3 @@ function buildAcpPrompt(
   return lines.join("\n");
 }
 
-function tryParseJsonObject(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("{")) {
-    const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fence?.[1]) {
-      try {
-        return JSON.parse(fence[1].trim());
-      } catch {
-        return undefined;
-      }
-    }
-    return undefined;
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return undefined;
-  }
-}

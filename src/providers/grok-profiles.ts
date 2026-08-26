@@ -12,8 +12,8 @@ export type GrokCapabilityProfile = {
   /** Whether always-approve / bypass permissions is enabled. */
   alwaysApprove: boolean;
   maxTurns: number;
-  /** Prefer structured JSON findings. */
-  preferStructuredOutput: boolean;
+  /** Prefer parsing findings JSON from the model's final text when present. */
+  preferParsedFindings: boolean;
 };
 
 /**
@@ -26,7 +26,7 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
       return {
         alwaysApprove: true,
         maxTurns: 80,
-        preferStructuredOutput: false,
+        preferParsedFindings: false,
         args: [
           "--sandbox",
           "workspace",
@@ -39,7 +39,7 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
       return {
         alwaysApprove: true,
         maxTurns: 30,
-        preferStructuredOutput: false,
+        preferParsedFindings: false,
         args: [
           "--sandbox",
           "read-only",
@@ -63,7 +63,7 @@ export function capabilityProfileForMode(mode: PeerMode): GrokCapabilityProfile 
       return {
         alwaysApprove: true,
         maxTurns: 25,
-        preferStructuredOutput: true,
+        preferParsedFindings: true,
         args: [
           "--sandbox",
           "read-only",

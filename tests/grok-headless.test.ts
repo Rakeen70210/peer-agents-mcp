@@ -42,6 +42,53 @@ printf '%s\\n' '${responseJson}'
   return { scriptPath, captureFile };
 }
 
+async function makeSequentialCli(
+  dir: string,
+  payloads: object[],
+  options?: { delayMs?: number },
+) {
+  const captureFile = join(dir, "args.txt");
+  const countFile = join(dir, "count.txt");
+  const scriptPath = join(dir, "fake-grok.sh");
+  for (let index = 0; index < payloads.length; index += 1) {
+    await writeFile(
+      join(dir, `resp-${index + 1}.json`),
+      `${JSON.stringify(payloads[index])}\n`,
+    );
+  }
+  const delay = options?.delayMs
+    ? `if [ "$count" -eq 1 ]; then sleep ${options.delayMs / 1000}; fi\n`
+    : "";
+  await writeFile(
+    scriptPath,
+    `#!/bin/sh
+count=0
+if [ -f "${countFile}" ]; then count=$(cat "${countFile}"); fi
+count=$((count + 1))
+printf '%s' "$count" > "${countFile}"
+printf 'INVOCATION=%s\\n' "$count" >> "${captureFile}"
+printf '%s\\n' "$@" >> "${captureFile}"
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--resume" ]; then echo "RESUME_ID=$arg" >> "${captureFile}"; fi
+  if [ "$arg" = "--session-id" ]; then echo HAD_SESSION_ID >> "${captureFile}"; fi
+  if [ "$arg" = "--json-schema" ]; then echo HAD_JSON_SCHEMA >> "${captureFile}"; fi
+  if [ "$prev" = "--prompt-file" ] && [ -f "$arg" ]; then
+    echo PROMPT_BODY_BEGIN >> "${captureFile}"
+    cat "$arg" >> "${captureFile}"
+    echo PROMPT_BODY_END >> "${captureFile}"
+  fi
+  prev=$arg
+done
+${delay}resp="${dir}/resp-$count.json"
+if [ ! -f "$resp" ]; then resp="${dir}/resp-${payloads.length}.json"; fi
+cat "$resp"
+`,
+  );
+  await chmod(scriptPath, 0o755);
+  return { scriptPath, captureFile, countFile };
+}
+
 test("grok reviewer profile uses read-only sandbox and prompt-file", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-grok-"));
   const { scriptPath, captureFile } = await makeCaptureCli(dir, {
@@ -85,6 +132,7 @@ test("grok reviewer profile uses read-only sandbox and prompt-file", async () =>
   assert.match(captured, /--deny\nBash\(git push \*\)/);
   assert.doesNotMatch(captured, /--permission-mode\ndefault/);
   assert.doesNotMatch(captured, /--check/);
+  assert.doesNotMatch(captured, /--json-schema/);
   assert.match(captured, /PROMPT_BODY_BEGIN[\s\S]*Review this huge patch/);
 });
 
@@ -143,7 +191,7 @@ test("grok passes --resume and skips worktree on follow-up", async () => {
   assert.doesNotMatch(captured, /--worktree/);
 });
 
-test("grok structured output uses json-schema and pretty-prints findings", async () => {
+test("grok reviewer parses findings JSON without passing --json-schema", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-grok-schema-"));
   const structured = {
     summary: "One issue found",
@@ -174,11 +222,36 @@ test("grok structured output uses json-schema and pretty-prints findings", async
   });
 
   assert.equal(result.isError, false);
+  assert.equal(result.incompleteReview, undefined);
   assert.deepEqual(result.structured, structured);
   assert.match(result.text, /\[major\]/);
   assert.match(result.text, /Null deref/);
   const captured = await readFile(captureFile, "utf8");
-  assert.match(captured, /--json-schema/);
+  assert.doesNotMatch(captured, /--json-schema/);
+  assert.match(captured, /Use tools \(read_file, grep, list_dir\)/);
+});
+
+test("complete prose without JSON is success with structured undefined", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-prose-"));
+  const { scriptPath, captureFile } = await makeCaptureCli(dir, {
+    text: "No material issues; the change is limited to X in `src/foo.ts`.",
+    sessionId: "sess-p",
+  });
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review",
+    mode: "reviewer",
+    structuredOutput: true,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.incompleteReview, undefined);
+  assert.equal(result.structured, undefined);
+  assert.match(result.text, /No material issues/);
+  const captured = await readFile(captureFile, "utf8");
+  assert.doesNotMatch(captured, /--json-schema/);
 });
 
 test("high risk review enables effort and does not pass removed --check", async () => {
@@ -361,4 +434,157 @@ test("git worktree isolation points --cwd at a real worktree", async () => {
     encoding: "utf8",
   });
   assert.match(listed, /peer-impl-wt/);
+});
+
+const STUB_FINDINGS = {
+  summary: "I'll inspect the full prompt, remediation plan, and current source/release contracts first…",
+  findings: [] as unknown[],
+  residual_risks: [] as unknown[],
+  recommended_next_steps: [] as unknown[],
+};
+
+const REAL_FINDINGS = {
+  summary: "One issue found",
+  findings: [
+    {
+      severity: "major",
+      file: "src/a.ts",
+      issue: "Null deref",
+      suggestion: "Add guard",
+    },
+  ],
+  residual_risks: [] as unknown[],
+  recommended_next_steps: ["Add a unit test"],
+};
+
+test("projectGrokResult marks live stub JSON as incomplete", () => {
+  const result = projectGrokResult({
+    stdout: JSON.stringify({
+      text: JSON.stringify(STUB_FINDINGS),
+      sessionId: "sess-stub",
+      num_turns: 1,
+    }),
+    stderr: "",
+    exitCode: 0,
+    expectStructured: true,
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.incompleteReview, true);
+  assert.equal(result.nativeSessionId, "sess-stub");
+});
+
+test("projectGrokResult parses concatenated stub+real as the last object", () => {
+  const result = projectGrokResult({
+    stdout: JSON.stringify({
+      text: JSON.stringify(STUB_FINDINGS) + JSON.stringify(REAL_FINDINGS),
+      sessionId: "sess-concat",
+    }),
+    stderr: "",
+    exitCode: 0,
+    expectStructured: true,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.incompleteReview, undefined);
+  assert.deepEqual(result.structured, REAL_FINDINGS);
+});
+
+test("stub JSON auto-continues once via --resume without --session-id or --json-schema", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-continue-"));
+  const { scriptPath, captureFile, countFile } = await makeSequentialCli(dir, [
+    { text: JSON.stringify(STUB_FINDINGS), sessionId: "sess-stub", num_turns: 1 },
+    { text: JSON.stringify(REAL_FINDINGS), sessionId: "sess-stub", num_turns: 2 },
+  ]);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    timeoutMs: 60_000,
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.incompleteReview, undefined);
+  assert.deepEqual(result.structured, REAL_FINDINGS);
+  assert.equal(result.resumed, true);
+  const captured = await readFile(captureFile, "utf8");
+  assert.match(captured, /INVOCATION=1/);
+  assert.match(captured, /INVOCATION=2/);
+  assert.match(captured, /RESUME_ID=sess-stub/);
+  assert.doesNotMatch(captured, /HAD_SESSION_ID/);
+  assert.doesNotMatch(captured, /HAD_JSON_SCHEMA/);
+  assert.doesNotMatch(captured, /--json-schema/);
+  const count = await readFile(countFile, "utf8");
+  assert.equal(count, "2");
+});
+
+test("stub JSON with remaining timeout below 30s floor does not auto-continue", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-floor-"));
+  const { scriptPath, captureFile, countFile } = await makeSequentialCli(dir, [
+    { text: JSON.stringify(STUB_FINDINGS), sessionId: "sess-stub", num_turns: 1 },
+  ]);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    timeoutMs: 2_000,
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.incompleteReview, true);
+  assert.equal(result.timedOut, undefined);
+  assert.match(result.continuationHint ?? "", /idempotency_key/);
+  const captured = await readFile(captureFile, "utf8");
+  assert.match(captured, /INVOCATION=1/);
+  assert.doesNotMatch(captured, /INVOCATION=2/);
+  assert.doesNotMatch(captured, /HAD_JSON_SCHEMA/);
+  const count = await readFile(countFile, "utf8");
+  assert.equal(count, "1");
+});
+
+test("repeated stub after auto-continue stays incompleteReview", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-stub-twice-"));
+  const { scriptPath, countFile } = await makeSequentialCli(dir, [
+    { text: JSON.stringify(STUB_FINDINGS), sessionId: "sess-stub", num_turns: 1 },
+  ]);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    timeoutMs: 60_000,
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.incompleteReview, true);
+  assert.match(result.continuationHint ?? "", /new idempotency_key/);
+  const count = await readFile(countFile, "utf8");
+  assert.equal(count, "2");
+});
+
+test("timeout with empty text is not treated as a stub and does not auto-continue", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-timeout-empty-"));
+  const scriptPath = join(dir, "fake-grok.sh");
+  await writeFile(
+    scriptPath,
+    `#!/bin/sh
+sleep 1
+`,
+  );
+  await chmod(scriptPath, 0o755);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    timeoutMs: 200,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.isError, true);
+  assert.equal(result.incompleteReview, undefined);
 });
