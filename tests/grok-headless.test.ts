@@ -874,3 +874,37 @@ printf '%s\\n' '{"text":"pong"}'
   assert.equal(timeouts[0], HEALTH_TURN_TIMEOUT_MS);
   assert.equal(health.ok, true);
 });
+
+test("Grok child env strips parent GROK_SESSION_ID from the spawned process", async (t) => {
+  isolateEnv(t, {
+    GROK_SESSION_ID: "parent",
+    GROK_AGENT: "parent",
+    GROK_SESSION: "parent",
+  });
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-child-env-"));
+  const scriptPath = join(dir, "fake-grok.sh");
+  await writeFile(
+    scriptPath,
+    `#!/bin/sh
+printf 'GROK_SESSION_ID=%s\\n' "$GROK_SESSION_ID"
+printf 'GROK_AGENT=%s\\n' "$GROK_AGENT"
+printf 'GROK_SESSION=%s\\n' "$GROK_SESSION"
+echo '{"type":"text","data":"ok"}'
+echo '{"type":"end","stopReason":"end_turn"}'
+`,
+  );
+  await chmod(scriptPath, 0o755);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    structuredOutput: false,
+    timeoutMs: 5_000,
+  });
+  assert.doesNotMatch(result.stdout, /parent/);
+  assert.match(result.stdout, /^GROK_SESSION_ID=$/m);
+  assert.doesNotMatch(result.stdout, /GROK_SESSION_ID=parent/);
+});

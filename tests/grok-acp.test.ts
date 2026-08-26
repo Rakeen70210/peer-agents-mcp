@@ -9,10 +9,28 @@ import { GrokAcpPool } from "../src/providers/grok-acp-pool.js";
 import { GrokAcpProvider } from "../src/providers/grok-acp-provider.js";
 import { createGrokProvider, isGrokAcpTransportEnabled } from "../src/providers/grok-factory.js";
 import { GrokHeadlessProvider } from "../src/providers/grok-headless.js";
+import { CONTINUATION_PROMPT } from "../src/providers/grok-review-quality.js";
 import {
   DEFAULT_GROK_TURN_TIMEOUT_MS,
   grokTurnTimeoutMs,
 } from "../src/providers/grok-timeout.js";
+
+const STUB_SENTENCE =
+  "I'll inspect the full prompt, remediation plan, and current source/release contracts first…";
+
+const REAL_FINDINGS = {
+  summary: "The follow-on defect plan correctly names the issue.",
+  findings: [
+    {
+      severity: "major",
+      file: "src/a.ts",
+      issue: "Null deref",
+      suggestion: "Add guard",
+    },
+  ],
+  residual_risks: [] as unknown[],
+  recommended_next_steps: ["Add a unit test"],
+};
 
 /**
  * Fake ACP agent: newline JSON-RPC over stdio.
@@ -20,7 +38,13 @@ import {
  */
 async function writeFakeAcp(
   dir: string,
-  options?: { promptDelayMs?: number; emitToolCall?: boolean; cancelFile?: string },
+  options?: {
+    promptDelayMs?: number;
+    emitToolCall?: boolean;
+    cancelFile?: string;
+    stubThenFindings?: boolean;
+    promptLog?: string;
+  },
 ) {
   const script = join(dir, "fake-acp.sh");
   // Node one-liner as fake agent for richer state.
@@ -33,6 +57,10 @@ import { appendFileSync } from "node:fs";
 const sessions = new Set();
 let nextId = 1;
 const cancelFile = ${JSON.stringify(options?.cancelFile ?? "")};
+const promptLog = ${JSON.stringify(options?.promptLog ?? "")};
+const stubThen = ${options?.stubThenFindings ? "true" : "false"};
+const stubSentence = ${JSON.stringify(STUB_SENTENCE)};
+const findingsJson = ${JSON.stringify(JSON.stringify(REAL_FINDINGS))};
 const rl = readline.createInterface({ input: process.stdin });
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\\n");
@@ -60,11 +88,25 @@ rl.on("line", (line) => {
   }
   if (msg.method === "session/prompt") {
     const sid = msg.params.sessionId;
+    const promptText = msg.params.prompt?.[0]?.text || "";
+    if (promptLog) {
+      appendFileSync(promptLog, JSON.stringify({ text: promptText }) + "\\n");
+    }
     const delay = ${options?.promptDelayMs ?? 0};
-    const emitTool = ${options?.emitToolCall ? "true" : "false"};
-    const text = (msg.params.prompt?.[0]?.text || "").includes("error-please")
+    const isContinuation = promptText.includes("Do not narrate setup");
+    let emitTool = ${options?.emitToolCall ? "true" : "false"};
+    let text = promptText.includes("error-please")
       ? ""
       : "peer-ok";
+    if (stubThen) {
+      if (!isContinuation) {
+        text = stubSentence;
+        emitTool = false;
+      } else {
+        text = findingsJson;
+        emitTool = false;
+      }
+    }
     const finish = () => {
       send({ jsonrpc: "2.0", method: "session/update", params: {
         sessionId: sid,
@@ -320,6 +362,97 @@ test("GrokAcpProvider default timeout uses grokTurnTimeoutMs", (t) => {
   const provider = new GrokAcpProvider({ timeoutMs: grokTurnTimeoutMs() });
   assert.equal(grokTurnTimeoutMs(), 360_000);
   void provider;
+});
+
+test("ACP prompt is tools-first, JSON last, and does not demand first-token JSON", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-acp-prompt-shape-"));
+  const promptLog = join(dir, "prompts.jsonl");
+  const command = await writeFakeAcp(dir, { promptLog });
+  const pool = new GrokAcpPool({ command, idleTimeoutMs: 60_000 });
+  const provider = new GrokAcpProvider({ pool, timeoutMs: 5_000 });
+  try {
+    const result = await provider.runTurn({
+      constructedPrompt: "Review this diff",
+      cwd: dir,
+      mode: "reviewer",
+    });
+    assert.equal(result.isError, false);
+    const logged = (await readFile(promptLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { text: string });
+    assert.equal(logged.length, 1);
+    const first = logged[0].text;
+    const toolsIndex = first.indexOf("Use tools (read_file, grep, list_dir)");
+    const bodyIndex = first.indexOf("Review this diff");
+    const jsonIndex = first.indexOf("When the review is finished");
+    assert.ok(toolsIndex >= 0, "tools instruction missing");
+    assert.ok(bodyIndex >= 0, "task body missing");
+    assert.ok(jsonIndex >= 0, "JSON-last instruction missing");
+    assert.ok(toolsIndex < bodyIndex, "tools must come before the task body");
+    assert.ok(bodyIndex < jsonIndex, "JSON schema must come after the task body");
+    assert.match(first, /Prose is acceptable/);
+    assert.doesNotMatch(first, /immediately/);
+    assert.doesNotMatch(first, /no markdown fences/);
+    assert.doesNotMatch(first, /respond with a single JSON object matching this schema \(no markdown fences\)/);
+  } finally {
+    await pool.disposeAll();
+  }
+});
+
+test("ACP stub auto-continues on the same session then returns findings JSON", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-acp-stub-continue-"));
+  const promptLog = join(dir, "prompts.jsonl");
+  const command = await writeFakeAcp(dir, { stubThenFindings: true, promptLog });
+  const pool = new GrokAcpPool({ command, idleTimeoutMs: 60_000 });
+  const provider = new GrokAcpProvider({ pool, timeoutMs: 60_000 });
+  try {
+    const result = await provider.runTurn({
+      constructedPrompt: "Review this diff",
+      cwd: dir,
+      mode: "reviewer",
+    });
+    assert.equal(result.isError, false);
+    assert.equal(result.incompleteReview, undefined);
+    assert.deepEqual(result.structured, REAL_FINDINGS);
+    assert.equal(result.resumed, true);
+    const logged = (await readFile(promptLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { text: string });
+    assert.equal(logged.length, 2);
+    assert.match(logged[0].text, /Use tools \(read_file, grep, list_dir\)/);
+    assert.match(logged[0].text, /Review this diff/);
+    assert.doesNotMatch(logged[0].text, /Do not narrate setup/);
+    assert.equal(logged[1].text, CONTINUATION_PROMPT);
+  } finally {
+    await pool.disposeAll();
+  }
+});
+
+test("ACP stub with remaining timeout below 30s floor does not auto-continue", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-acp-stub-floor-"));
+  const promptLog = join(dir, "prompts.jsonl");
+  const command = await writeFakeAcp(dir, { stubThenFindings: true, promptLog });
+  const pool = new GrokAcpPool({ command, idleTimeoutMs: 60_000 });
+  const provider = new GrokAcpProvider({ pool, timeoutMs: 2_000 });
+  try {
+    const result = await provider.runTurn({
+      constructedPrompt: "Review this diff",
+      cwd: dir,
+      mode: "reviewer",
+      timeoutMs: 2_000,
+    });
+    assert.equal(result.isError, true);
+    assert.equal(result.incompleteReview, true);
+    assert.equal(result.timedOut, undefined);
+    assert.match(result.text, /I'll inspect/);
+    assert.match(result.continuationHint ?? "", /idempotency_key/);
+    const logged = (await readFile(promptLog, "utf8")).trim().split("\n");
+    assert.equal(logged.length, 1);
+  } finally {
+    await pool.disposeAll();
+  }
 });
 
 test("ACP prompt timeout sends session/cancel and drops liveSessions", async () => {

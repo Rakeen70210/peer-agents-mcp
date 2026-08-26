@@ -23,7 +23,12 @@ import {
   formatStructuredAsText,
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
-import { parseJsonStringArray, runCommand, stripCliNoise } from "./runner.js";
+import {
+  grokChildEnv,
+  parseJsonStringArray,
+  runCommand,
+  stripCliNoise,
+} from "./runner.js";
 import {
   AUTO_CONTINUE_FLOOR_MS,
   grokTurnTimeoutMs,
@@ -101,6 +106,7 @@ export class GrokHeadlessProvider implements PeerProvider {
       command: this.command,
       args: ["--version"],
       timeoutMs: HEALTH_TURN_TIMEOUT_MS,
+      env: grokChildEnv(),
     });
     if (versionProbe.exitCode === 0 && versionProbe.stdout.trim()) {
       return {
@@ -274,6 +280,7 @@ export class GrokHeadlessProvider implements PeerProvider {
         cwd: input.cwd,
         timeoutMs,
         signal: input.signal,
+        env: grokChildEnv(),
         onStdoutLine: (line) => streamState.onLine(line),
       });
 

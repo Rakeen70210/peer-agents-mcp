@@ -3,9 +3,14 @@ import {
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
 import { capabilityProfileForMode } from "./grok-profiles.js";
-import { lastFindingsObject } from "./grok-review-quality.js";
+import {
+  CONTINUATION_PROMPT,
+  isIncompletePeerReview,
+  lastFindingsObject,
+} from "./grok-review-quality.js";
 import { getSharedGrokAcpPool, type GrokAcpPool } from "./grok-acp-pool.js";
-import { grokTurnTimeoutMs } from "./grok-timeout.js";
+import type { AcpPromptResult } from "./grok-acp-client.js";
+import { AUTO_CONTINUE_FLOOR_MS, grokTurnTimeoutMs } from "./grok-timeout.js";
 import type { PeerProvider, PeerRunInput, PeerRunResult } from "./types.js";
 
 export type GrokAcpProviderOptions = {
@@ -59,7 +64,6 @@ export class GrokAcpProvider implements PeerProvider {
     const wantStructured =
       input.structuredOutput ?? profile.preferParsedFindings;
 
-    // Annotate prompt with peer constraints that headless flags used to enforce.
     const prompt = buildAcpPrompt(input.constructedPrompt, {
       mode: input.mode,
       structured: wantStructured,
@@ -95,7 +99,8 @@ export class GrokAcpProvider implements PeerProvider {
         await input.onNativeSessionId?.(sessionId);
       }
 
-      const result = await client.prompt({
+      const started = Date.now();
+      let result = await client.prompt({
         sessionId,
         text: prompt,
         timeoutMs,
@@ -103,66 +108,49 @@ export class GrokAcpProvider implements PeerProvider {
         onProgress: input.onProgress,
       });
 
-      if (result.cancelled) {
-        return {
-          isError: true,
-          text: result.text,
-          stdout: result.text,
-          stderr: result.error ?? "Grok ACP cancelled",
-          cancelled: true,
-          nativeSessionId: sessionId,
-          resumed,
-          metrics: result.metrics,
-          progress: result.progress,
-        };
-      }
-      if (result.timedOut) {
-        return {
-          isError: true,
-          text: result.text,
-          stdout: result.text,
-          stderr: result.error ?? `Grok ACP timed out after ${timeoutMs}ms`,
-          timedOut: true,
-          nativeSessionId: sessionId,
-          resumed,
-          metrics: result.metrics,
-          progress: result.progress,
-        };
-      }
-      if (result.isError) {
-        return {
-          isError: true,
-          text: result.text || result.error || "",
-          stdout: result.text,
-          stderr: result.error ?? "Grok ACP error",
-          nativeSessionId: sessionId,
-          resumed,
-          metrics: result.metrics,
-          progress: result.progress,
-        };
-      }
+      const failure = acpFailureResult(result, sessionId, resumed, timeoutMs);
+      if (failure) return failure;
 
-      let text = result.text;
-      let structured: unknown;
-      if (wantStructured) {
-        structured = lastFindingsObject(text);
-        if (structured) {
-          const pretty = formatStructuredAsText(structured);
-          if (pretty) text = pretty;
-        }
-      }
-
-      return {
-        isError: false,
-        text,
-        stdout: result.text,
-        stderr: "",
-        nativeSessionId: sessionId,
+      let projected = projectAcpSuccess({
+        result,
+        sessionId,
         resumed,
-        metrics: result.metrics,
-        structured,
-        progress: result.progress,
-      };
+        wantStructured,
+      });
+
+      if (wantStructured && shouldAutoContinue(projected)) {
+        const remaining = timeoutMs - (Date.now() - started);
+        if (remaining < AUTO_CONTINUE_FLOOR_MS) {
+          return withIncompleteHint(projected);
+        }
+        result = await client.prompt({
+          sessionId,
+          text: CONTINUATION_PROMPT,
+          timeoutMs: remaining,
+          signal: input.signal,
+          onProgress: input.onProgress,
+        });
+        const continuedFailure = acpFailureResult(
+          result,
+          sessionId,
+          false,
+          remaining,
+        );
+        if (continuedFailure) return continuedFailure;
+        projected = projectAcpSuccess({
+          result,
+          sessionId,
+          resumed: true,
+          wantStructured,
+        });
+        if (isIncompletePeerReview(projected)) {
+          return withIncompleteHint({ ...projected, resumed: false });
+        }
+      } else if (wantStructured && projected.incompleteReview) {
+        return withIncompleteHint(projected);
+      }
+
+      return projected;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -192,13 +180,118 @@ function buildAcpPrompt(
       "You may edit files and run commands when that helps complete the implementation task.",
     );
   }
+  // Tools first — do not demand first-token JSON.
+  lines.push(
+    "Use tools (read_file, grep, list_dir) to inspect the repo before answering. Do not end the turn with a plan to inspect.",
+    "",
+    body,
+  );
   if (options.structured) {
     lines.push(
-      "When reporting findings, respond with a single JSON object matching this schema (no markdown fences):",
+      "",
+      "When the review is finished, prefer a single JSON object matching this schema. Prose is acceptable. No preamble-only turns, no concatenated objects.",
       JSON.stringify(PEER_FINDINGS_JSON_SCHEMA),
     );
   }
-  lines.push("", body);
   return lines.join("\n");
 }
 
+function projectAcpSuccess(options: {
+  result: AcpPromptResult;
+  sessionId: string;
+  resumed: boolean;
+  wantStructured: boolean;
+}): PeerRunResult {
+  const rawText = options.result.text;
+  let text = rawText;
+  let structured: unknown;
+  if (options.wantStructured) {
+    structured = lastFindingsObject(rawText);
+    if (structured) {
+      const pretty = formatStructuredAsText(structured);
+      if (pretty) text = pretty;
+    }
+  }
+  const incomplete =
+    options.wantStructured &&
+    isIncompletePeerReview({ text: rawText, structured });
+  return {
+    isError: incomplete,
+    incompleteReview: incomplete || undefined,
+    text,
+    stdout: rawText,
+    stderr: "",
+    nativeSessionId: options.sessionId,
+    resumed: options.resumed,
+    metrics: options.result.metrics,
+    structured,
+    progress: options.result.progress,
+  };
+}
+
+function acpFailureResult(
+  result: AcpPromptResult,
+  sessionId: string,
+  resumed: boolean,
+  timeoutMs: number,
+): PeerRunResult | undefined {
+  if (result.cancelled) {
+    return {
+      isError: true,
+      text: result.text,
+      stdout: result.text,
+      stderr: result.error ?? "Grok ACP cancelled",
+      cancelled: true,
+      nativeSessionId: sessionId,
+      resumed,
+      metrics: result.metrics,
+      progress: result.progress,
+    };
+  }
+  if (result.timedOut) {
+    return {
+      isError: true,
+      text: result.text,
+      stdout: result.text,
+      stderr: result.error ?? `Grok ACP timed out after ${timeoutMs}ms`,
+      timedOut: true,
+      nativeSessionId: sessionId,
+      resumed,
+      metrics: result.metrics,
+      progress: result.progress,
+    };
+  }
+  if (result.isError) {
+    return {
+      isError: true,
+      text: result.text || result.error || "",
+      stdout: result.text,
+      stderr: result.error ?? "Grok ACP error",
+      nativeSessionId: sessionId,
+      resumed,
+      metrics: result.metrics,
+      progress: result.progress,
+    };
+  }
+  return undefined;
+}
+
+function shouldAutoContinue(result: PeerRunResult): boolean {
+  return (
+    !result.timedOut &&
+    !result.cancelled &&
+    Boolean(result.nativeSessionId) &&
+    isIncompletePeerReview(result)
+  );
+}
+
+function withIncompleteHint(result: PeerRunResult): PeerRunResult {
+  return {
+    ...result,
+    isError: true,
+    incompleteReview: true,
+    continuationHint:
+      result.continuationHint ??
+      "Incomplete peer review (intent-only stub). Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.",
+  };
+}

@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 import { readFile } from "node:fs/promises";
 
+import { grokChildEnv } from "./runner.js";
 import type { PeerRunMetrics, PeerRunProgress } from "./types.js";
 
 type JsonRpcId = number | string;
@@ -106,7 +107,7 @@ export class GrokAcpClient {
     const args = ["agent", "--always-approve", ...this.agentArgs, "stdio"];
     const proc = spawn(this.command, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, NO_COLOR: "1" },
+      env: grokChildEnv(),
     });
     this.proc = proc;
 
@@ -304,6 +305,7 @@ export class GrokAcpClient {
 
   async createSession(cwd: string): Promise<string> {
     await this.ensureStarted();
+    // Process --always-approve is the permission source of truth; do not set _meta.yoloMode.
     const result = (await this.request("session/new", {
       cwd,
       mcpServers: [],

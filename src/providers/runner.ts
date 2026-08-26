@@ -35,7 +35,9 @@ export async function runCommand(options: {
     const useProcessGroup = process.platform !== "win32";
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env, NO_COLOR: "1" },
+      // When provided, options.env is the complete child environment.
+      // Spreading process.env first would re-inject keys deleted by grokChildEnv.
+      env: options.env ?? { ...process.env, NO_COLOR: "1" },
       stdio: ["pipe", "pipe", "pipe"],
       // Own process group so timeout/cancel can kill grandchildren without
       // signalling the MCP server process group.
@@ -198,4 +200,13 @@ export function stripCliNoise(text: string): string {
     .filter((line) => !/^\s*Loaded cached credentials\.?\s*$/i.test(line))
     .join("\n")
     .trim();
+}
+
+/** Complete child env for nested Grok: strip parent session identity after merge. */
+export function grokChildEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra, NO_COLOR: "1" };
+  delete env.GROK_AGENT;
+  delete env.GROK_SESSION_ID;
+  delete env.GROK_SESSION;
+  return env;
 }

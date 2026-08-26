@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { AntigravityHeadlessProvider } from "../src/providers/antigravity-headless.js";
-import { runCommand } from "../src/providers/runner.js";
+import { grokChildEnv, runCommand } from "../src/providers/runner.js";
 
 test("runCommand aborts via signal and preserves captured output", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-runner-"));
@@ -28,10 +28,15 @@ echo never
     args: [],
     timeoutMs: 60_000,
     signal: controller.signal,
+    onStdout: (chunk) => {
+      if (chunk.includes("partial-out")) {
+        setTimeout(() => controller.abort(), 80);
+      }
+    },
   });
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  controller.abort();
+  const fallback = setTimeout(() => controller.abort(), 2_000);
   const result = await running;
+  clearTimeout(fallback);
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 5_000, `abort should be quick, took ${elapsed}ms`);
@@ -55,11 +60,49 @@ sleep 30
   const result = await runCommand({
     command: script,
     args: [],
-    timeoutMs: 150,
+    timeoutMs: 2_000,
   });
   assert.equal(result.timedOut, true);
   assert.equal(result.aborted, false);
   assert.match(result.stdout, /before-timeout/);
+});
+
+test("runCommand uses options.env as the complete child environment", async (t) => {
+  const previous = {
+    GROK_SESSION_ID: process.env.GROK_SESSION_ID,
+    GROK_AGENT: process.env.GROK_AGENT,
+    GROK_SESSION: process.env.GROK_SESSION,
+  };
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  process.env.GROK_SESSION_ID = "parent";
+  process.env.GROK_AGENT = "parent";
+  process.env.GROK_SESSION = "parent";
+
+  const dir = await mkdtemp(join(tmpdir(), "peer-runner-env-"));
+  const script = join(dir, "print-env.sh");
+  await writeFile(
+    script,
+    `#!/bin/sh
+printf 'GROK_SESSION_ID=%s\\n' "$GROK_SESSION_ID"
+printf 'GROK_AGENT=%s\\n' "$GROK_AGENT"
+printf 'GROK_SESSION=%s\\n' "$GROK_SESSION"
+`,
+  );
+  await chmod(script, 0o755);
+
+  const result = await runCommand({
+    command: script,
+    args: [],
+    timeoutMs: 5_000,
+    env: grokChildEnv(),
+  });
+  assert.doesNotMatch(result.stdout, /parent/);
+  assert.match(result.stdout, /^GROK_SESSION_ID=$/m);
 });
 
 test("antigravity still cleans up staged attachments on abort", async () => {
