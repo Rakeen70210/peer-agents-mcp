@@ -51,6 +51,10 @@ export type PeerRunInput = {
    * When set, the prompt should be the current request only (history lives in CLI).
    */
   nativeSessionId?: string;
+  /** Cold-start UUID for Grok headless `--session-id` / persist-before-spawn. */
+  assignedSessionId?: string;
+  /** Persist a newly discovered native session id (ACP createSession) before prompt. */
+  onNativeSessionId?: (id: string) => void | Promise<void>;
   /** Risk level — may raise reasoning effort for Grok. */
   riskLevel?: PeerRiskLevel;
   complexity?: PeerComplexity;
@@ -85,6 +89,8 @@ export type PeerRunProgress = {
   eventCount: number;
   textSnippet?: string;
   lastThought?: string;
+  lastTool?: string;
+  toolCallCount?: number;
   numTurns?: number;
   stopReason?: string;
 };

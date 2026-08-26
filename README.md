@@ -155,8 +155,10 @@ Add it to your client's MCP servers config (example for a typical stdio setup):
 - `PEER_AGENTS_STORAGE_DIR` — where sessions are persisted (default: `~/.peer-agents/sessions`)
 - `PEER_AGENTS_ENABLED_PROVIDERS` — comma list whitelist of peer CLIs (`grok`, `antigravity`). Use `antigravity` alone when the host is Grok so peers never re-enter Grok.
 - `PEER_AGENTS_DISABLED_PROVIDERS` — comma list blacklist (ignored if `PEER_AGENTS_ENABLED_PROVIDERS` is set)
-- `PEER_AGENTS_TURN_TIMEOUT_MS` — per-turn synchronous timeout (default 120s for Grok, 300s for Antigravity)
+- `GROK_TURN_TIMEOUT_MS` — Grok sync timeout for headless and ACP (default 6 minutes / 360000ms). Grok does **not** read `PEER_AGENTS_TURN_TIMEOUT_MS`.
+- `PEER_AGENTS_TURN_TIMEOUT_MS` — Antigravity sync fallback only (default 300s). Does not pin Grok. Operators who want the old 120s Grok timeout must set `GROK_TURN_TIMEOUT_MS=120000`.
 - `ANTIGRAVITY_TURN_TIMEOUT_MS` — optional Antigravity sync override
+- `PEER_AGENTS_GROK_ACP_IDLE_MS` — ACP between-turns idle recycle (default max(5 min, Grok turn timeout + 60s)). In-flight `session/prompt` ignores idle.
 - `PEER_AGENTS_JOB_TIMEOUT_MS` — async job timeout (default 30 minutes)
 - `GROK_JOB_TIMEOUT_MS` / `ANTIGRAVITY_JOB_TIMEOUT_MS` — optional async per-provider overrides
 - `PEER_AGENTS_MAX_PROMPT_CHARS` — safety limit on prompt size
@@ -180,16 +182,16 @@ Grok peer turns use modern headless flags under the hood (callers do not pass th
 | Concern | Behavior |
 |---------|----------|
 | Large prompts | Always `--prompt-file` (avoids argv limits) |
-| Multi-turn | `--resume <nativeSessionId>` when available; falls back to MCP transcript rehydrate |
+| Multi-turn | `--resume <nativeSessionId>` when available; cold start mints `--session-id` before spawn; falls back to MCP transcript rehydrate |
 | Reviewer / critic | `--sandbox read-only`, `--always-approve`, deny edit tools, no web search, `--no-plan`, `--no-subagents` |
 | Planner | `--sandbox read-only`, `--permission-mode plan`, `--always-approve` |
 | Implementer | `--sandbox workspace`, `--always-approve` |
 | `peer_implement_async` | Default git worktree isolation via `git worktree add` + `--cwd` (`use_worktree: false` to opt out). Grok 1.0 headless ignores `--worktree`. |
-| Review findings | `--json-schema` structured findings when useful; also returned as `structured` |
+| Review findings | Best-effort parse of findings JSON from final text; prose is a valid review. Grok headless does not pass `--json-schema`. |
 | Risk / security | Elevated `--effort`; extra self-verify `--rules` (Grok 1.0 removed `--check`) |
 | Specialists | Packaged `--agent` for security review / architecture planning |
-| Async progress | `--output-format streaming-json` + `progress` on `peer_job_status` |
-| ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse |
+| Sync + async output | Always `--output-format streaming-json` (json-envelope fallback if the CLI still emits one object). `progress` on `peer_job_status`. |
+| ACP pool (opt-in) | `PEER_AGENTS_GROK_TRANSPORT=acp` warm process reuse. Idle is a between-turns backstop; in-flight prompts ignore it. |
 | Spend telemetry | `metrics` on results (`usage`, `num_turns`, `stopReason`, cost when present) |
 
 ## Antigravity CLI integration (agy 1.1.8+)

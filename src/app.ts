@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 
 import { classifyAttachments } from "./attachments.js";
@@ -31,7 +32,10 @@ import {
   verifyMessage,
 } from "./prompts.js";
 import { AntigravityHeadlessProvider } from "./providers/antigravity-headless.js";
-import { createGrokProvider } from "./providers/grok-factory.js";
+import {
+  createGrokProvider,
+  isGrokAcpTransportEnabled,
+} from "./providers/grok-factory.js";
 import {
   isLikelyResumeFailure,
   sanitizeWorktreeName,
@@ -137,6 +141,7 @@ export type CompareProviderResult = {
   nativeSessionId?: string;
   isError: boolean;
   timedOut?: boolean;
+  cancelled?: boolean;
   progress?: PeerRunProgress;
   incompleteReview?: boolean;
   continuationHint?: string;
@@ -165,6 +170,7 @@ export type RoutedPeerResult = {
   nativeSessionId?: string;
   isError: boolean;
   timedOut?: boolean;
+  cancelled?: boolean;
   resumed?: boolean;
   metrics?: PeerRunMetrics;
   structured?: unknown;
@@ -581,6 +587,7 @@ export function createApp(options: AppOptions = {}) {
     files: Array<{ path: string; content: string }> | undefined,
     runOptions: PeerTurnOptions | undefined,
     nativeSessionId: string | undefined,
+    assignedSessionId?: string,
   ): Promise<PeerRunResult> {
     const provider = getProvider(session.provider);
     return provider.runTurn({
@@ -591,6 +598,12 @@ export function createApp(options: AppOptions = {}) {
       timeoutMs: runOptions?.timeoutMs,
       signal: runOptions?.signal,
       nativeSessionId,
+      assignedSessionId,
+      onNativeSessionId: async (id) => {
+        if (session.nativeSessionId === id) return;
+        session.nativeSessionId = id;
+        await persist(session);
+      },
       riskLevel: runOptions?.riskLevel,
       complexity: runOptions?.complexity,
       focus: runOptions?.focus,
@@ -612,10 +625,13 @@ export function createApp(options: AppOptions = {}) {
     userMessageForTranscript: string,
     runOptions?: PeerTurnOptions,
   ): Promise<TurnResult> {
+    const grokHeadless =
+      session.provider === "grok" && !isGrokAcpTransportEnabled();
+    const hadNative = Boolean(session.nativeSessionId);
     // Grok uses --resume; Antigravity uses --conversation (both via nativeSessionId).
     const canResume =
       (session.provider === "grok" || session.provider === "antigravity") &&
-      Boolean(session.nativeSessionId);
+      hadNative;
 
     let truncated = false;
     if (canResume) {
@@ -664,12 +680,19 @@ export function createApp(options: AppOptions = {}) {
 
     const full = enforcePromptLimit(buildPrompt(session, input));
     truncated = full.truncated;
+    let assignedSessionId: string | undefined;
+    if (grokHeadless && !session.nativeSessionId) {
+      assignedSessionId = randomUUID();
+      session.nativeSessionId = assignedSessionId;
+      await persist(session);
+    }
     const peerResult = await invokeProvider(
       session,
       full.prompt,
       input.files,
       runOptions,
       undefined,
+      assignedSessionId,
     );
 
     if (peerResult.cancelled || runOptions?.signal?.aborted) {
@@ -1031,6 +1054,7 @@ export function createApp(options: AppOptions = {}) {
       context?: string;
       planA?: string;
       planB?: string;
+      signal?: AbortSignal;
     }): Promise<RoutedTaskResult> {
       await hydrate();
 
@@ -1098,6 +1122,7 @@ export function createApp(options: AppOptions = {}) {
               focus: input.focus,
               structuredOutput:
                 mode === "planner" || mode === "implementer" ? false : undefined,
+              signal: input.signal,
             },
           );
           return {
@@ -1111,6 +1136,7 @@ export function createApp(options: AppOptions = {}) {
             nativeSessionId: result.nativeSessionId,
             isError: result.isError ?? false,
             timedOut: result.timedOut,
+            cancelled: result.cancelled,
             resumed: result.resumed,
             metrics: result.metrics,
             structured: result.structured,
@@ -1172,6 +1198,7 @@ export function createApp(options: AppOptions = {}) {
       task?: string;
       needsSpeed?: boolean;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       const focus = input.focus ?? "general";
       const kind: TaskKind =
@@ -1192,6 +1219,7 @@ export function createApp(options: AppOptions = {}) {
         focus,
         mode: "reviewer",
         idempotencyKey: input.idempotencyKey,
+        signal: input.signal,
       });
     },
 
@@ -1204,6 +1232,7 @@ export function createApp(options: AppOptions = {}) {
       complexity?: "simple" | "complex";
       files?: Array<{ path: string; content: string }>;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       return app.executeRouted({
         kind: "plan",
@@ -1221,6 +1250,7 @@ export function createApp(options: AppOptions = {}) {
         idempotencyKey: input.idempotencyKey,
         constraints: input.constraints,
         repoSummary: input.repoSummary,
+        signal: input.signal,
       });
     },
 
@@ -1233,6 +1263,7 @@ export function createApp(options: AppOptions = {}) {
       files?: Array<{ path: string; content: string }>;
       task?: string;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       return app.executeRouted({
         kind: "debug",
@@ -1249,6 +1280,7 @@ export function createApp(options: AppOptions = {}) {
         idempotencyKey: input.idempotencyKey,
         errorLog: input.errorLog,
         attemptedFixes: input.attemptedFixes,
+        signal: input.signal,
       });
     },
 
@@ -1260,6 +1292,7 @@ export function createApp(options: AppOptions = {}) {
       task?: string;
       riskLevel?: RiskLevel;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       return app.executeRouted({
         kind: "verify",
@@ -1272,6 +1305,7 @@ export function createApp(options: AppOptions = {}) {
         mode: "reviewer",
         idempotencyKey: input.idempotencyKey,
         testOutput: input.testOutput,
+        signal: input.signal,
       });
     },
 
@@ -1282,6 +1316,7 @@ export function createApp(options: AppOptions = {}) {
       repoPath: string;
       riskLevel?: RiskLevel;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       return app.executeRouted({
         kind: "debate",
@@ -1297,6 +1332,7 @@ export function createApp(options: AppOptions = {}) {
         idempotencyKey: input.idempotencyKey,
         planA: input.planA,
         planB: input.planB,
+        signal: input.signal,
       });
     },
 
@@ -1307,6 +1343,7 @@ export function createApp(options: AppOptions = {}) {
       files?: Array<{ path: string; content: string }>;
       task?: string;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }) {
       return app.executeRouted({
         kind: "general_knowledge",
@@ -1321,6 +1358,7 @@ export function createApp(options: AppOptions = {}) {
         idempotencyKey: input.idempotencyKey,
         question: input.question,
         context: input.context,
+        signal: input.signal,
       });
     },
 
@@ -1328,6 +1366,7 @@ export function createApp(options: AppOptions = {}) {
       message: string;
       diff?: string;
       files?: Array<{ path: string; content: string }>;
+      signal?: AbortSignal;
     }) {
       await hydrate();
       const session = getSession(input.sessionId);
@@ -1347,6 +1386,7 @@ export function createApp(options: AppOptions = {}) {
             files: input.files,
           },
           input.message,
+          { signal: input.signal },
         );
         commitOperation(session, input.idempotencyKey, result);
         await persist(session);
@@ -1596,6 +1636,7 @@ export function createApp(options: AppOptions = {}) {
       system?: string;
       parallel?: boolean;
       idempotencyKey: string;
+      signal?: AbortSignal;
     }): Promise<CompareResult> {
       await hydrate();
 
@@ -1640,6 +1681,7 @@ export function createApp(options: AppOptions = {}) {
             session,
             turnInput,
             input.message,
+            { signal: input.signal },
           );
           return {
             provider,
@@ -1650,6 +1692,7 @@ export function createApp(options: AppOptions = {}) {
             nativeSessionId: result.nativeSessionId,
             isError: result.isError ?? false,
             timedOut: result.timedOut,
+            cancelled: result.cancelled,
             progress: result.progress,
             incompleteReview: result.incompleteReview,
             continuationHint: result.continuationHint,
@@ -1802,10 +1845,12 @@ function continuationHintFor(
   flags: { timedOut?: boolean; incompleteReview?: boolean },
 ): string | undefined {
   if (!flags.timedOut && !flags.incompleteReview) return undefined;
-  const lead = flags.timedOut
-    ? peerResult.stderr || "Grok timed out"
-    : "Incomplete peer review (intent-only stub).";
-  return `${lead} Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.`;
+  if (flags.timedOut) {
+    const lead = peerResult.stderr || "Grok timed out";
+    const toolCalls = peerResult.progress?.toolCallCount ?? 0;
+    return `${lead} after ${toolCalls} tool calls. Partial progress attached. Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.`;
+  }
+  return "Incomplete peer review (intent-only stub). Call peer_turn or peer_turn_async with this sessionId, a new idempotency_key, and unchanged expected_version. nativeSessionId is already on the session.";
 }
 
 const SECRET_PATTERNS = [

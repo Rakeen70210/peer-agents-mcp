@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { createApp } from "../src/app.js";
+import { GrokHeadlessProvider } from "../src/providers/grok-headless.js";
 import type { PeerProvider, PeerRunResult } from "../src/providers/types.js";
 
 class RecordingProvider implements PeerProvider {
@@ -129,4 +130,67 @@ test("routed ask routes general knowledge to Antigravity", async () => {
 
   assert.deepEqual(result.routes, ["antigravity"]);
   assert.equal(grok.models.length, 0);
+});
+
+test("abort routedReviewDiff cancels the grok child with SIGTERM", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-routed-abort-"));
+  const sigFile = join(dir, "signal.txt");
+  const agent = join(dir, "slow-grok.mjs");
+  const scriptPath = join(dir, "slow-grok.sh");
+  await writeFile(
+    agent,
+    `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(sigFile)}, "STARTED\\n");
+const mark = (sig) => {
+  writeFileSync(${JSON.stringify(sigFile)}, sig + "\\n");
+  process.exit(0);
+};
+process.on("SIGTERM", () => mark("TERM"));
+process.on("SIGINT", () => mark("INT"));
+setTimeout(() => {}, 30_000);
+`,
+  );
+  await writeFile(scriptPath, `#!/bin/sh\nexec node "${agent}" "$@"\n`);
+  await chmod(scriptPath, 0o755);
+
+  const grok = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+    timeoutMs: 60_000,
+  });
+  const antigravity: PeerProvider = {
+    name: "antigravity",
+    healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+    runTurn: async () => ({
+      isError: false,
+      text: "n/a",
+      stdout: "",
+      stderr: "",
+    }),
+  };
+  const app = createApp({
+    storageDir: join(dir, "sessions"),
+    providers: { grok, antigravity },
+  });
+  await app.hydrate();
+
+  const controller = new AbortController();
+  const pending = app.routedReviewDiff({
+    diff: "diff --git a/foo b/foo\n+x",
+    repoPath: dir,
+    idempotencyKey: "routed-abort-1",
+    signal: controller.signal,
+  });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const started = await readFile(sigFile, "utf8").catch(() => "");
+    if (started.includes("STARTED")) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  controller.abort();
+  const result = await pending;
+  assert.equal(result.results.grok?.cancelled, true);
+  assert.equal(result.results.grok?.isError, true);
+  const signaled = await readFile(sigFile, "utf8").catch(() => "");
+  assert.match(signaled, /TERM|INT/);
 });

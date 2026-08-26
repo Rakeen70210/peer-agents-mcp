@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 import { GrokAcpClient } from "./grok-acp-client.js";
+import { grokAcpIdleTimeoutMs } from "./grok-timeout.js";
 import { parsePositiveInt } from "./runner.js";
 
 export type GrokAcpPoolOptions = {
@@ -24,12 +25,7 @@ export class GrokAcpPool {
     this.maxClients =
       options.maxClients ??
       parsePositiveInt(process.env.PEER_AGENTS_GROK_ACP_MAX_CLIENTS, 4);
-    this.idleTimeoutMs =
-      options.idleTimeoutMs ??
-      parsePositiveInt(
-        process.env.PEER_AGENTS_GROK_ACP_IDLE_MS,
-        5 * 60_000,
-      );
+    this.idleTimeoutMs = options.idleTimeoutMs ?? grokAcpIdleTimeoutMs();
   }
 
   private keyFor(cwd: string): string {

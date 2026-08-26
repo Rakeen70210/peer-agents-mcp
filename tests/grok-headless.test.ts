@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { jobTimeoutMsFor } from "../src/app.js";
 import {
   GrokHeadlessProvider,
   isLikelyResumeFailure,
@@ -13,16 +14,31 @@ import {
   sanitizeWorktreeName,
 } from "../src/providers/grok-headless.js";
 import { formatStructuredAsText } from "../src/providers/grok-schema.js";
+import {
+  DEFAULT_GROK_TURN_TIMEOUT_MS,
+  grokAcpIdleTimeoutMs,
+  grokTurnTimeoutMs,
+  HEALTH_TURN_TIMEOUT_MS,
+} from "../src/providers/grok-timeout.js";
+
+function mintedSessionId(captured: string): string | undefined {
+  const fromFlag = captured.match(/--session-id\n([^\n]+)/);
+  if (fromFlag?.[1]) return fromFlag[1];
+  const fromEcho = captured.match(/^SESSION_ID=(.+)$/m);
+  return fromEcho?.[1];
+}
 
 async function makeCaptureCli(dir: string, response: object) {
   const captureFile = join(dir, "args.txt");
   const scriptPath = join(dir, "fake-grok.sh");
-  const responseJson = JSON.stringify(response).replace(/'/g, `'\\''`);
+  const responsePath = join(dir, "response.json");
+  await writeFile(responsePath, `${JSON.stringify(response)}\n`);
   await writeFile(
     scriptPath,
     `#!/bin/sh
 printf '%s\\n' "$@" > "${captureFile}"
 # also dump prompt-file contents if present
+session_id=
 prev=
 for arg in "$@"; do
   if [ "$prev" = "--prompt-file" ]; then
@@ -33,10 +49,54 @@ for arg in "$@"; do
       echo "PROMPT_BODY_END" >> "${captureFile}"
     fi
   fi
+  if [ "$prev" = "--session-id" ]; then
+    session_id="$arg"
+    echo "SESSION_ID=$arg" >> "${captureFile}"
+  fi
+  if [ "$arg" = "--session-id" ]; then echo HAD_SESSION_ID >> "${captureFile}"; fi
+  if [ "$arg" = "--resume" ]; then echo HAD_RESUME >> "${captureFile}"; fi
   prev=$arg
 done
-printf '%s\\n' '${responseJson}'
+RESPONSE_FILE="${responsePath}" SESSION_ID="$session_id" node -e '
+const fs = require("fs");
+const r = JSON.parse(fs.readFileSync(process.env.RESPONSE_FILE, "utf8"));
+if (process.env.SESSION_ID) r.sessionId = process.env.SESSION_ID;
+process.stdout.write(JSON.stringify(r) + "\\n");
+'
 `,
+  );
+  await chmod(scriptPath, 0o755);
+  return { scriptPath, captureFile };
+}
+
+async function makeStreamingCli(
+  dir: string,
+  events: object[],
+  options?: { sleepMs?: number },
+) {
+  const captureFile = join(dir, "args.txt");
+  const scriptPath = join(dir, "fake-grok.sh");
+  const eventsPath = join(dir, "events.ndjson");
+  await writeFile(
+    eventsPath,
+    events.map((event) => JSON.stringify(event)).join("\n") + (events.length ? "\n" : ""),
+  );
+  const sleep = options?.sleepMs ? `sleep ${Math.max(1, options.sleepMs / 1000)}\n` : "";
+  await writeFile(
+    scriptPath,
+    `#!/bin/sh
+printf '%s\\n' "$@" > "${captureFile}"
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--session-id" ]; then echo "SESSION_ID=$arg" >> "${captureFile}"; fi
+  if [ "$arg" = "--session-id" ]; then echo HAD_SESSION_ID >> "${captureFile}"; fi
+  if [ "$arg" = "--resume" ]; then echo HAD_RESUME >> "${captureFile}"; fi
+  prev=$arg
+done
+if [ -s "${eventsPath}" ]; then
+  node -e 'const fs=require("fs"); process.stdout.write(fs.readFileSync(process.argv[1],"utf8"));' "${eventsPath}"
+fi
+${sleep}`,
   );
   await chmod(scriptPath, 0o755);
   return { scriptPath, captureFile };
@@ -71,7 +131,8 @@ printf '%s\\n' "$@" >> "${captureFile}"
 prev=
 for arg in "$@"; do
   if [ "$prev" = "--resume" ]; then echo "RESUME_ID=$arg" >> "${captureFile}"; fi
-  if [ "$arg" = "--session-id" ]; then echo HAD_SESSION_ID >> "${captureFile}"; fi
+  if [ "$prev" = "--session-id" ]; then echo "SESSION_ID=$arg" >> "${captureFile}"; fi
+  if [ "$arg" = "--session-id" ]; then echo "HAD_SESSION_ID=$count" >> "${captureFile}"; fi
   if [ "$arg" = "--json-schema" ]; then echo HAD_JSON_SCHEMA >> "${captureFile}"; fi
   if [ "$prev" = "--prompt-file" ] && [ -f "$arg" ]; then
     echo PROMPT_BODY_BEGIN >> "${captureFile}"
@@ -116,11 +177,13 @@ test("grok reviewer profile uses read-only sandbox and prompt-file", async () =>
   });
 
   assert.equal(result.isError, false);
-  assert.equal(result.nativeSessionId, "sess-1");
+  const captured = await readFile(captureFile, "utf8");
+  assert.equal(result.nativeSessionId, mintedSessionId(captured));
   assert.equal(result.metrics?.numTurns, 3);
   assert.equal(result.metrics?.usage?.totalTokens, 35);
-
-  const captured = await readFile(captureFile, "utf8");
+  assert.match(captured, /--output-format\nstreaming-json/);
+  assert.match(captured, /--session-id\n/);
+  assert.doesNotMatch(captured, /--resume/);
   assert.match(captured, /--prompt-file/);
   assert.match(captured, /--sandbox\nread-only/);
   assert.match(captured, /--disallowed-tools\nsearch_replace,write/);
@@ -188,8 +251,10 @@ test("grok passes --resume and skips worktree on follow-up", async () => {
 
   assert.equal(result.resumed, true);
   assert.equal(result.isError, false);
+  assert.equal(result.nativeSessionId, "sess-1");
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /--resume\nsess-1/);
+  assert.doesNotMatch(captured, /--session-id/);
   assert.doesNotMatch(captured, /--worktree/);
 });
 
@@ -515,8 +580,12 @@ test("stub JSON auto-continues once via --resume without --session-id or --json-
   const captured = await readFile(captureFile, "utf8");
   assert.match(captured, /INVOCATION=1/);
   assert.match(captured, /INVOCATION=2/);
-  assert.match(captured, /RESUME_ID=sess-stub/);
-  assert.doesNotMatch(captured, /HAD_SESSION_ID/);
+  const minted = mintedSessionId(captured);
+  assert.ok(minted);
+  assert.equal(result.nativeSessionId, minted);
+  assert.match(captured, new RegExp(`RESUME_ID=${minted}`));
+  assert.match(captured, /HAD_SESSION_ID=1/);
+  assert.doesNotMatch(captured, /HAD_SESSION_ID=2/);
   assert.doesNotMatch(captured, /HAD_JSON_SCHEMA/);
   assert.doesNotMatch(captured, /--json-schema/);
   const count = await readFile(countFile, "utf8");
@@ -599,14 +668,9 @@ test("implementer stub does not auto-continue with the review continuation promp
 
 test("timeout with empty text is not treated as a stub and does not auto-continue", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peer-grok-timeout-empty-"));
-  const scriptPath = join(dir, "fake-grok.sh");
-  await writeFile(
-    scriptPath,
-    `#!/bin/sh
-sleep 1
-`,
-  );
-  await chmod(scriptPath, 0o755);
+  const { scriptPath, captureFile } = await makeStreamingCli(dir, [], {
+    sleepMs: 1000,
+  });
   const provider = new GrokHeadlessProvider({
     command: scriptPath,
     promptDir: join(dir, "prompts"),
@@ -614,9 +678,170 @@ sleep 1
   const result = await provider.runTurn({
     constructedPrompt: "Review this diff",
     mode: "reviewer",
-    timeoutMs: 200,
+    timeoutMs: 400,
   });
   assert.equal(result.timedOut, true);
   assert.equal(result.isError, true);
   assert.equal(result.incompleteReview, undefined);
+  const captured = await readFile(captureFile, "utf8");
+  assert.equal(result.nativeSessionId, mintedSessionId(captured));
+  assert.ok(result.nativeSessionId);
+});
+
+test("sync runTurn without streamProgress still uses streaming-json and mints --session-id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-always-stream-"));
+  const { scriptPath, captureFile } = await makeCaptureCli(dir, {
+    text: "ok",
+    sessionId: "sess-1",
+  });
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review",
+    mode: "reviewer",
+    structuredOutput: false,
+  });
+  const captured = await readFile(captureFile, "utf8");
+  assert.match(captured, /--output-format\nstreaming-json/);
+  assert.doesNotMatch(captured, /--resume/);
+  assert.equal(result.nativeSessionId, mintedSessionId(captured));
+  assert.notEqual(result.nativeSessionId, "sess-1");
+});
+
+test("timeout with thought and tool_call returns progress and minted session id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-timeout-tools-"));
+  const { scriptPath, captureFile } = await makeStreamingCli(
+    dir,
+    [
+      { type: "thought", data: "inspecting repo" },
+      { type: "tool_call", toolName: "read_file", title: "read_file" },
+    ],
+    { sleepMs: 2000 },
+  );
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const result = await provider.runTurn({
+    constructedPrompt: "Review this diff",
+    mode: "reviewer",
+    timeoutMs: 400,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.isError, true);
+  assert.equal(result.incompleteReview, undefined);
+  assert.ok((result.progress?.toolCallCount ?? 0) > 0);
+  assert.equal(result.progress?.lastTool, "read_file");
+  const captured = await readFile(captureFile, "utf8");
+  assert.equal(result.nativeSessionId, mintedSessionId(captured));
+  assert.match(captured, /--output-format\nstreaming-json/);
+  assert.match(captured, /--session-id\n/);
+  assert.doesNotMatch(captured, /HAD_RESUME/);
+});
+
+test("with GROK_TURN_TIMEOUT_MS unset and PEER_AGENTS_TURN_TIMEOUT_MS=120000, captured runCommand timeoutMs is 360000", async () => {
+  const prevGrok = process.env.GROK_TURN_TIMEOUT_MS;
+  const prevPeer = process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
+  delete process.env.GROK_TURN_TIMEOUT_MS;
+  process.env.PEER_AGENTS_TURN_TIMEOUT_MS = "120000";
+  const capturedTimeouts: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: TimerHandler, ms?: number, ...args: unknown[]) => {
+    if (typeof ms === "number") capturedTimeouts.push(ms);
+    return realSetTimeout(fn as never, ms as never, ...(args as never[]));
+  }) as typeof setTimeout;
+  try {
+    assert.equal(grokTurnTimeoutMs(), DEFAULT_GROK_TURN_TIMEOUT_MS);
+    const dir = await mkdtemp(join(tmpdir(), "peer-grok-default-to-"));
+    const { scriptPath } = await makeCaptureCli(dir, { text: "ok", sessionId: "s" });
+    const provider = new GrokHeadlessProvider({
+      command: scriptPath,
+      promptDir: join(dir, "prompts"),
+    });
+    await provider.runTurn({
+      constructedPrompt: "Review",
+      mode: "reviewer",
+      structuredOutput: false,
+    });
+    assert.ok(
+      capturedTimeouts.includes(DEFAULT_GROK_TURN_TIMEOUT_MS),
+      `expected ${DEFAULT_GROK_TURN_TIMEOUT_MS} in ${capturedTimeouts.join(",")}`,
+    );
+    assert.equal(capturedTimeouts.includes(120_000), false);
+    assert.equal(jobTimeoutMsFor("grok"), 1_800_000);
+    assert.ok(grokAcpIdleTimeoutMs() >= grokTurnTimeoutMs() + 60_000);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    if (prevGrok === undefined) delete process.env.GROK_TURN_TIMEOUT_MS;
+    else process.env.GROK_TURN_TIMEOUT_MS = prevGrok;
+    if (prevPeer === undefined) delete process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
+    else process.env.PEER_AGENTS_TURN_TIMEOUT_MS = prevPeer;
+  }
+});
+
+test("GROK_TURN_TIMEOUT_MS=5000 wins; a 1s fake survives and an 8s fake times out", async () => {
+  const prev = process.env.GROK_TURN_TIMEOUT_MS;
+  process.env.GROK_TURN_TIMEOUT_MS = "5000";
+  try {
+    const dir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-"));
+    const fast = await makeStreamingCli(dir, [{ type: "text", data: "ok" }, { type: "end" }], {
+      sleepMs: 1000,
+    });
+    const slowDir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-slow-"));
+    const slow = await makeStreamingCli(slowDir, [{ type: "thought", data: "hmm" }], {
+      sleepMs: 8000,
+    });
+    const fastProvider = new GrokHeadlessProvider({
+      command: fast.scriptPath,
+      promptDir: join(dir, "prompts"),
+    });
+    const slowProvider = new GrokHeadlessProvider({
+      command: slow.scriptPath,
+      promptDir: join(slowDir, "prompts"),
+    });
+    const survived = await fastProvider.runTurn({
+      constructedPrompt: "Review",
+      mode: "reviewer",
+      structuredOutput: false,
+    });
+    assert.equal(survived.timedOut, undefined);
+    assert.equal(survived.isError, false);
+    const timed = await slowProvider.runTurn({
+      constructedPrompt: "Review",
+      mode: "reviewer",
+      structuredOutput: false,
+    });
+    assert.equal(timed.timedOut, true);
+  } finally {
+    if (prev === undefined) delete process.env.GROK_TURN_TIMEOUT_MS;
+    else process.env.GROK_TURN_TIMEOUT_MS = prev;
+  }
+});
+
+test("healthCheck fallback runTurn uses 15s timeout", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-health-"));
+  const scriptPath = join(dir, "fake-grok.sh");
+  await writeFile(
+    scriptPath,
+    `#!/bin/sh
+if [ "$1" = "--version" ]; then exit 1; fi
+printf '%s\\n' '{"text":"pong"}'
+`,
+  );
+  await chmod(scriptPath, 0o755);
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+  });
+  const timeouts: number[] = [];
+  const orig = provider.runTurn.bind(provider);
+  provider.runTurn = async (input) => {
+    timeouts.push(input.timeoutMs ?? -1);
+    return orig(input);
+  };
+  const health = await provider.healthCheck();
+  assert.equal(timeouts[0], HEALTH_TURN_TIMEOUT_MS);
+  assert.equal(health.ok, true);
 });

@@ -26,6 +26,7 @@ test("stream accumulator builds text and progress from NDJSON events", () => {
   });
   acc.onLine(JSON.stringify({ type: "text", data: "Hello " }));
   acc.onLine(JSON.stringify({ type: "thought", data: "thinking hard" }));
+  acc.onLine(JSON.stringify({ type: "tool_call", toolName: "read_file", title: "read_file" }));
   acc.onLine(JSON.stringify({ type: "text", data: "world" }));
   acc.onLine(
     JSON.stringify({
@@ -40,6 +41,8 @@ test("stream accumulator builds text and progress from NDJSON events", () => {
   assert.equal(acc.endEvent()?.sessionId, "s1");
   assert.equal(acc.progress().numTurns, 4);
   assert.match(acc.progress().lastThought ?? "", /thinking hard/);
+  assert.equal(acc.progress().toolCallCount, 1);
+  assert.equal(acc.progress().lastTool, "read_file");
   assert.ok(updates.length >= 3);
 
   const projected = projectStreamingGrokResult({
@@ -211,9 +214,10 @@ printf '%s\\n' '{"type":"end","stopReason":"EndTurn","sessionId":"stream-1","num
 
   assert.equal(result.isError, false);
   assert.equal(result.text, "partial answer");
-  assert.equal(result.nativeSessionId, "stream-1");
-  assert.ok(progressEvents.length >= 1);
   const captured = await readFile(captureFile, "utf8");
+  const minted = captured.match(/--session-id\n([^\n]+)/)?.[1];
+  assert.equal(result.nativeSessionId, minted);
+  assert.ok(progressEvents.length >= 1);
   assert.match(captured, /--output-format\nstreaming-json/);
 });
 

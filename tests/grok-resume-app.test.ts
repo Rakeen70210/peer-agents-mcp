@@ -149,8 +149,11 @@ class RecordingAntigravity implements PeerProvider {
       text: next.text,
       stdout: next.text,
       stderr: next.stderr ?? "",
-      nativeSessionId: next.nativeSessionId ?? "agy-conv",
+      nativeSessionId:
+        "nativeSessionId" in next ? next.nativeSessionId : "agy-conv",
       resumed: Boolean(input.nativeSessionId) && !(next.isError ?? false),
+      timedOut: next.timedOut,
+      cancelled: next.cancelled,
     };
   }
 }
@@ -327,4 +330,122 @@ test("incomplete review persists nativeSessionId without assistant transcript", 
   assert.equal(stored.nativeSessionId, "native-stub");
   assert.equal(stored.messages.length, 0);
   assert.equal(stored.version, 0);
+});
+
+test("grok headless cold start persists assignedSessionId before spawn", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-mint-persist-"));
+  let sawAssigned: string | undefined;
+  let sawNativeOnCall: string | undefined;
+  let storedBeforeReturn: string | undefined;
+
+  class ObservingGrok implements PeerProvider {
+    readonly name = "grok" as const;
+    async healthCheck() {
+      return { ok: true, latencyMs: 1 };
+    }
+    async runTurn(input: PeerRunInput): Promise<PeerRunResult> {
+      sawAssigned = input.assignedSessionId;
+      sawNativeOnCall = input.nativeSessionId;
+      const files = await readdir(storageDir);
+      const sessionFile = files.find((file) => file.endsWith(".json"));
+      if (sessionFile) {
+        const stored = JSON.parse(
+          await readFile(join(storageDir, sessionFile), "utf8"),
+        ) as { nativeSessionId?: string };
+        storedBeforeReturn = stored.nativeSessionId;
+      }
+      return {
+        isError: true,
+        text: "partial",
+        stdout: "",
+        stderr: "Grok timed out after 200ms",
+        timedOut: true,
+        nativeSessionId: input.assignedSessionId,
+        progress: {
+          updatedAt: new Date().toISOString(),
+          eventCount: 2,
+          lastThought: "inspecting",
+          lastTool: "read_file",
+          toolCallCount: 2,
+        },
+      };
+    }
+  }
+
+  const grok = new ObservingGrok();
+  const app = createApp({
+    storageDir,
+    providers: {
+      grok,
+      antigravity: new RecordingGrok([{ text: "n/a" }]),
+    },
+  });
+  await app.hydrate();
+  const started = await app.start({
+    provider: "grok",
+    task: "review",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  const result = await app.turn({
+    sessionId: started.sessionId,
+    message: "Please review",
+    idempotencyKey: "timeout-1",
+  });
+
+  assert.ok(sawAssigned);
+  assert.match(sawAssigned ?? "", /^[0-9a-f-]{36}$/i);
+  assert.equal(sawNativeOnCall, undefined);
+  assert.equal(storedBeforeReturn, sawAssigned);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.nativeSessionId, sawAssigned);
+  assert.match(result.response, /partial/);
+  assert.match(result.continuationHint ?? "", /new idempotency_key/);
+  assert.match(result.continuationHint ?? "", /tool calls/);
+  const transcript = await app.transcript({ sessionId: started.sessionId });
+  const messages = transcript.transcript as Array<{ role: string }>;
+  assert.equal(messages.filter((message) => message.role === "assistant").length, 0);
+});
+
+test("agy timeout must not persist a random UUID nativeSessionId", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-agy-timeout-"));
+  const antigravity = new RecordingAntigravity([
+    {
+      text: "",
+      isError: true,
+      timedOut: true,
+      nativeSessionId: undefined,
+      stderr: "Antigravity timed out",
+    },
+  ]);
+  const app = createApp({
+    storageDir,
+    providers: {
+      grok: new RecordingGrok([{ text: "n/a" }]),
+      antigravity,
+    },
+  });
+  await app.hydrate();
+  const started = await app.start({
+    provider: "antigravity",
+    task: "ask",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  const result = await app.turn({
+    sessionId: started.sessionId,
+    message: "What is X?",
+    idempotencyKey: "agy-timeout-1",
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(antigravity.calls[0].assignedSessionId, undefined);
+  assert.equal(antigravity.calls[0].nativeSessionId, undefined);
+
+  const files = await readdir(storageDir);
+  const sessionFile = files.find((file) => file.endsWith(".json"));
+  assert.ok(sessionFile);
+  const stored = JSON.parse(await readFile(join(storageDir, sessionFile!), "utf8")) as {
+    nativeSessionId?: string;
+  };
+  assert.equal(stored.nativeSessionId, undefined);
 });

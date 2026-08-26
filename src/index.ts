@@ -24,6 +24,9 @@ const modeSchema = z.enum(["reviewer", "planner", "critic", "implementer"]);
 const CONTEXT_PACKING_PREAMBLE =
   "Before calling: read relevant source files and attach full contents via `files`. Pass complete diffs/logs — never prose summaries. Set `task` with goals, affected behavior, and specific concerns.";
 
+const GROK_SYNC_TIMEOUT_WARNING =
+  "Grok sync may take several minutes. If your MCP client times out under 3 minutes, use the matching *_async tool and poll peer_job_status every 30-60s.";
+
 function jsonResult(value: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
@@ -48,7 +51,7 @@ async function main() {
 
   server.tool(
     "peer_review_diff",
-    `${CONTEXT_PACKING_PREAMBLE} Route a diff review to the best peer model(s) based on focus and risk.`,
+    `${CONTEXT_PACKING_PREAMBLE} Route a diff review to the best peer model(s) based on focus and risk. ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       diff: z
         .string()
@@ -66,7 +69,7 @@ async function main() {
         .describe("Prefer a faster peer when true; still include full context."),
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedReviewDiff({
           diff: input.diff,
@@ -77,13 +80,14 @@ async function main() {
           task: input.task,
           needsSpeed: input.needs_speed,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
 
   server.tool(
     "peer_plan",
-    `${CONTEXT_PACKING_PREAMBLE} Route an implementation planning request to the best peer model(s).`,
+    `${CONTEXT_PACKING_PREAMBLE} Route an implementation planning request to the best peer model(s). ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       task: z
         .string()
@@ -108,7 +112,7 @@ async function main() {
       files: filesSchema,
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedPlan({
           task: input.task,
@@ -119,13 +123,14 @@ async function main() {
           complexity: input.complexity,
           files: input.files,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
 
   server.tool(
     "peer_debug",
-    `${CONTEXT_PACKING_PREAMBLE} Route a debugging request after failures.`,
+    `${CONTEXT_PACKING_PREAMBLE} Route a debugging request after failures. ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       error_log: z
         .string()
@@ -150,7 +155,7 @@ async function main() {
       task: taskSchema,
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedDebug({
           errorLog: input.error_log,
@@ -161,13 +166,14 @@ async function main() {
           files: input.files,
           task: input.task,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
 
   server.tool(
     "peer_verify",
-    `${CONTEXT_PACKING_PREAMBLE} Route verification of tests/build output.`,
+    `${CONTEXT_PACKING_PREAMBLE} Route verification of tests/build output. ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       test_output: z
         .string()
@@ -181,7 +187,7 @@ async function main() {
       risk_level: riskSchema,
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedVerify({
           testOutput: input.test_output,
@@ -191,6 +197,7 @@ async function main() {
           task: input.task,
           riskLevel: input.risk_level,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
@@ -215,7 +222,7 @@ async function main() {
       task: taskSchema,
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedAsk({
           question: input.question,
@@ -224,13 +231,14 @@ async function main() {
           files: input.files,
           task: input.task,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
 
   server.tool(
     "peer_debate",
-    `${CONTEXT_PACKING_PREAMBLE} Independently compare Plan A vs Plan B without cross-contamination.`,
+    `${CONTEXT_PACKING_PREAMBLE} Independently compare Plan A vs Plan B without cross-contamination. ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       task: z
         .string()
@@ -245,7 +253,7 @@ async function main() {
       risk_level: riskSchema,
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) =>
+    async (input, extra) =>
       jsonResult(
         await app.routedDebate({
           task: input.task,
@@ -254,13 +262,14 @@ async function main() {
           repoPath: input.repo_path,
           riskLevel: input.risk_level,
           idempotencyKey: input.idempotency_key,
+          signal: extra.signal,
         }),
       ),
   );
 
   server.tool(
     "peer_turn",
-    `${CONTEXT_PACKING_PREAMBLE} Follow up in an existing routed peer session (use session_id from a prior result).`,
+    `${CONTEXT_PACKING_PREAMBLE} Follow up in an existing routed peer session (use session_id from a prior result). ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       session_id: z.string().describe("session_id from results.<cli>.sessionId in a prior routed tool response."),
       message: z
@@ -278,7 +287,7 @@ async function main() {
         .optional()
         .describe("Pass version from the last turn to avoid stale-session races."),
     },
-    async (input) => {
+    async (input, extra) => {
       const turnResult = await app.turn({
         sessionId: input.session_id,
         message: input.message,
@@ -286,6 +295,7 @@ async function main() {
         files: input.files,
         idempotencyKey: input.idempotency_key,
         expectedVersion: input.expected_version,
+        signal: extra.signal,
       });
       const contextAdvisory = contextQualityHint(
         assessContextQuality({
@@ -482,7 +492,7 @@ async function main() {
 
   server.tool(
     "peer_compare",
-    `${CONTEXT_PACKING_PREAMBLE} Low-level dual-CLI comparison (prefer phase tools for routing).`,
+    `${CONTEXT_PACKING_PREAMBLE} Low-level dual-CLI comparison (prefer phase tools for routing). ${GROK_SYNC_TIMEOUT_WARNING}`,
     {
       message: z
         .string()
@@ -497,7 +507,7 @@ async function main() {
       parallel: z.boolean().optional(),
       idempotency_key: idempotencyKeySchema,
     },
-    async (input) => {
+    async (input, extra) => {
       const compareResult = await app.compare({
         message: input.message,
         repoPath: input.repo_path,
@@ -509,6 +519,7 @@ async function main() {
         system: input.system,
         parallel: input.parallel,
         idempotencyKey: input.idempotency_key,
+        signal: extra.signal,
       });
       const contextAdvisory = contextQualityHint(
         assessContextQuality({

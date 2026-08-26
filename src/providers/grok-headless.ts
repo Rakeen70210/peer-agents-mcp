@@ -23,12 +23,12 @@ import {
   formatStructuredAsText,
   PEER_FINDINGS_JSON_SCHEMA,
 } from "./grok-schema.js";
+import { parseJsonStringArray, runCommand, stripCliNoise } from "./runner.js";
 import {
-  parseJsonStringArray,
-  parsePositiveInt,
-  runCommand,
-  stripCliNoise,
-} from "./runner.js";
+  AUTO_CONTINUE_FLOOR_MS,
+  grokTurnTimeoutMs,
+  HEALTH_TURN_TIMEOUT_MS,
+} from "./grok-timeout.js";
 import type {
   PeerProvider,
   PeerRunInput,
@@ -36,8 +36,6 @@ import type {
   PeerRunProgress,
   PeerRunResult,
 } from "./types.js";
-
-const AUTO_CONTINUE_FLOOR_MS = 30_000;
 
 type GrokJsonResponse = {
   text?: string;
@@ -81,9 +79,7 @@ export class GrokHeadlessProvider implements PeerProvider {
     this.command = options.command ?? process.env.GROK_COMMAND ?? "grok";
     const envArgs = parseJsonStringArray(process.env.GROK_ARGS, "GROK_ARGS");
     this.baseArgs = options.baseArgs ?? envArgs;
-    this.timeoutMs =
-      options.timeoutMs ??
-      parsePositiveInt(process.env.PEER_AGENTS_TURN_TIMEOUT_MS, 120_000);
+    this.timeoutMs = grokTurnTimeoutMs(options.timeoutMs);
     this.promptDir =
       options.promptDir ??
       process.env.PEER_AGENTS_PROMPT_DIR ??
@@ -98,7 +94,7 @@ export class GrokHeadlessProvider implements PeerProvider {
     const versionProbe = await runCommand({
       command: this.command,
       args: ["--version"],
-      timeoutMs: 15_000,
+      timeoutMs: HEALTH_TURN_TIMEOUT_MS,
     });
     if (versionProbe.exitCode === 0 && versionProbe.stdout.trim()) {
       return {
@@ -112,6 +108,7 @@ export class GrokHeadlessProvider implements PeerProvider {
       constructedPrompt: "Reply with exactly: pong",
       mode: "reviewer",
       structuredOutput: false,
+      timeoutMs: HEALTH_TURN_TIMEOUT_MS,
     });
     return {
       ok: !result.isError && /pong/i.test(result.text),
@@ -141,6 +138,7 @@ export class GrokHeadlessProvider implements PeerProvider {
       input: { ...input, cwd },
       timeoutMs,
       resumeId,
+      assignedSessionId: resumeId ? undefined : input.assignedSessionId,
       worktreeName: requestedWorktree,
     });
 
@@ -182,12 +180,17 @@ export class GrokHeadlessProvider implements PeerProvider {
     input: PeerRunInput;
     timeoutMs: number;
     resumeId?: string;
+    assignedSessionId?: string;
     worktreeName?: string;
   }): Promise<PeerRunResult> {
     const { input, timeoutMs, resumeId, worktreeName } = options;
     const profile = capabilityProfileForMode(input.mode);
     const parseFindings = prefersParsedFindings(input);
-    const stream = Boolean(input.streamProgress);
+    const assignedSessionId =
+      resumeId
+        ? undefined
+        : options.assignedSessionId ?? input.assignedSessionId ?? randomUUID();
+    const nativeSessionId = resumeId ?? assignedSessionId;
 
     const promptPath = await this.writePromptFile(input.constructedPrompt);
     try {
@@ -196,12 +199,14 @@ export class GrokHeadlessProvider implements PeerProvider {
         "--prompt-file",
         promptPath,
         "--output-format",
-        stream ? "streaming-json" : "json",
+        "streaming-json",
         ...profile.args,
       ];
 
       if (resumeId) {
         args.push("--resume", resumeId);
+      } else if (assignedSessionId) {
+        args.push("--session-id", assignedSessionId);
       }
       if (input.model) {
         args.push("--model", input.model);
@@ -255,9 +260,7 @@ export class GrokHeadlessProvider implements PeerProvider {
       }
       args.push("--rules", rules.join(" "));
 
-      const streamState = stream
-        ? createStreamAccumulator(input.onProgress)
-        : undefined;
+      const streamState = createStreamAccumulator(input.onProgress);
 
       const result = await runCommand({
         command: this.command,
@@ -265,55 +268,65 @@ export class GrokHeadlessProvider implements PeerProvider {
         cwd: input.cwd,
         timeoutMs,
         signal: input.signal,
-        onStdoutLine: streamState
-          ? (line) => streamState.onLine(line)
-          : undefined,
+        onStdoutLine: (line) => streamState.onLine(line),
       });
 
       if (result.aborted || input.signal?.aborted) {
         return {
           isError: true,
-          text: "",
+          text: streamState.text(),
           stdout: result.stdout,
           stderr: "Grok cancelled",
           cancelled: true,
-          nativeSessionId: resumeId,
+          nativeSessionId,
           worktreeName,
-          progress: streamState?.progress(),
+          progress: streamState.progress(),
         };
       }
 
       if (result.timedOut) {
         return {
           isError: true,
-          text: streamState?.text() ?? "",
+          text: streamState.text(),
           stdout: result.stdout,
           stderr: `Grok timed out after ${timeoutMs}ms`,
           timedOut: true,
-          nativeSessionId: resumeId,
+          nativeSessionId,
           worktreeName,
-          progress: streamState?.progress(),
+          progress: streamState.progress(),
         };
       }
 
-      if (stream && streamState) {
-        return projectStreamingGrokResult({
+      const overlayMinted = (projected: PeerRunResult): PeerRunResult => ({
+        ...projected,
+        nativeSessionId,
+        progress: projected.progress ?? streamState.progress(),
+      });
+
+      const end = streamState.endEvent();
+      const streamedText = streamState.text().trim();
+      if (!end && !streamedText && isGrokJsonEnvelope(stripCliNoise(result.stdout))) {
+        return overlayMinted(
+          projectGrokResult({
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exitCode: result.exitCode,
+            worktreeName,
+            expectStructured: parseFindings,
+          }),
+        );
+      }
+
+      return overlayMinted(
+        projectStreamingGrokResult({
           streamState,
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.exitCode,
           worktreeName,
           expectStructured: parseFindings,
-        });
-      }
-
-      return projectGrokResult({
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exitCode: result.exitCode,
-        worktreeName,
-        expectStructured: parseFindings,
-      });
+        }),
+      );
     } finally {
       await rm(promptPath, { force: true }).catch(() => undefined);
     }
@@ -339,6 +352,8 @@ export function createStreamAccumulator(
 ): StreamAccumulator {
   let text = "";
   let lastThought = "";
+  let lastTool = "";
+  let toolCallCount = 0;
   let eventCount = 0;
   let endEvent: GrokJsonResponse | undefined;
   let lastProgress: PeerRunProgress = {
@@ -352,6 +367,8 @@ export function createStreamAccumulator(
       eventCount,
       textSnippet: text.slice(-500) || undefined,
       lastThought: lastThought.slice(-400) || undefined,
+      lastTool: lastTool || undefined,
+      toolCallCount: toolCallCount || undefined,
       numTurns: endEvent?.num_turns,
       stopReason: endEvent?.stopReason,
     };
@@ -368,6 +385,9 @@ export function createStreamAccumulator(
       const event = safeJsonParse<{
         type?: string;
         data?: string;
+        toolName?: string;
+        title?: string;
+        status?: string;
         stopReason?: string;
         sessionId?: string;
         num_turns?: number;
@@ -386,6 +406,14 @@ export function createStreamAccumulator(
         text += event.data;
       } else if (event.type === "thought" && typeof event.data === "string") {
         lastThought = event.data;
+      } else if (event.type === "tool_call") {
+        toolCallCount += 1;
+        lastTool = event.toolName ?? event.title ?? lastTool;
+        if (!lastThought && lastTool) lastThought = lastTool;
+      } else if (event.type === "tool_call_update") {
+        if (typeof event.status === "string" && event.status) {
+          lastThought = event.status;
+        }
       } else if (event.type === "end") {
         endEvent = {
           text,
@@ -636,6 +664,18 @@ export function isLikelyResumeFailure(result: PeerRunResult): boolean {
     blob.includes("invalid session") ||
     blob.includes("unknown conversation") ||
     blob.includes("invalid conversation")
+  );
+}
+
+function isGrokJsonEnvelope(stdout: string): boolean {
+  const parsed = safeJsonParse<GrokJsonResponse>(stdout);
+  if (!parsed || typeof parsed !== "object") return false;
+  return (
+    parsed.text !== undefined ||
+    parsed.sessionId !== undefined ||
+    parsed.error !== undefined ||
+    parsed.stopReason !== undefined ||
+    parsed.num_turns !== undefined
   );
 }
 

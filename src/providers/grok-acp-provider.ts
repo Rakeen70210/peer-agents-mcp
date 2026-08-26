@@ -5,7 +5,7 @@ import {
 import { capabilityProfileForMode } from "./grok-profiles.js";
 import { lastFindingsObject } from "./grok-review-quality.js";
 import { getSharedGrokAcpPool, type GrokAcpPool } from "./grok-acp-pool.js";
-import { parsePositiveInt } from "./runner.js";
+import { grokTurnTimeoutMs } from "./grok-timeout.js";
 import type { PeerProvider, PeerRunInput, PeerRunResult } from "./types.js";
 
 export type GrokAcpProviderOptions = {
@@ -30,9 +30,7 @@ export class GrokAcpProvider implements PeerProvider {
       getSharedGrokAcpPool({
         command: options.command,
       });
-    this.timeoutMs =
-      options.timeoutMs ??
-      parsePositiveInt(process.env.PEER_AGENTS_TURN_TIMEOUT_MS, 120_000);
+    this.timeoutMs = grokTurnTimeoutMs(options.timeoutMs);
   }
 
   async healthCheck() {
@@ -94,6 +92,7 @@ export class GrokAcpProvider implements PeerProvider {
       }
       if (!sessionId) {
         sessionId = await client.createSession(cwd);
+        await input.onNativeSessionId?.(sessionId);
       }
 
       const result = await client.prompt({

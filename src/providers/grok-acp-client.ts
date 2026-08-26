@@ -50,6 +50,7 @@ export class GrokAcpClient {
   private starting: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   private closed = false;
+  private promptDepth = 0;
 
   /** ACP session ids known to be live on this process. */
   readonly liveSessions = new Set<string>();
@@ -66,6 +67,13 @@ export class GrokAcpClient {
   }
 
   touch(): void {
+    if (this.promptDepth > 0) {
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+      return;
+    }
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.idleTimeoutMs <= 0 || this.closed) return;
     this.idleTimer = setTimeout(() => {
@@ -234,20 +242,28 @@ export class GrokAcpClient {
   }
 
   private request(method: string, params?: unknown, timeoutMs = 60_000): Promise<unknown> {
+    this.promptDepth += 1;
     this.touch();
     const id = this.nextId++;
+    const settle = () => {
+      this.promptDepth = Math.max(0, this.promptDepth - 1);
+      this.touch();
+    };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        settle();
         reject(new Error(`ACP request timed out: ${method}`));
       }, timeoutMs);
       this.pending.set(id, {
         resolve: (value) => {
           clearTimeout(timer);
+          settle();
           resolve(value);
         },
         reject: (error) => {
           clearTimeout(timer);
+          settle();
           reject(error);
         },
       });
@@ -256,6 +272,7 @@ export class GrokAcpClient {
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
+        settle();
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -307,24 +324,29 @@ export class GrokAcpClient {
     signal?: AbortSignal;
     onProgress?: (progress: PeerRunProgress) => void;
   }): Promise<AcpPromptResult> {
-    await this.ensureStarted();
-    this.touch();
-
-    if (input.signal?.aborted) {
-      return {
-        text: "",
-        sessionId: input.sessionId,
-        cancelled: true,
-        isError: true,
-        error: "Cancelled before start",
-      };
+    this.promptDepth += 1;
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
     }
 
     let text = "";
     let lastThought = "";
+    let lastTool = "";
+    let toolCallCount = 0;
     let eventCount = 0;
     let stopReason: string | undefined;
     let metrics: PeerRunMetrics | undefined;
+
+    const progressSnapshot = (): PeerRunProgress => ({
+      updatedAt: new Date().toISOString(),
+      eventCount,
+      textSnippet: text.slice(-500) || undefined,
+      lastThought: lastThought.slice(-400) || undefined,
+      lastTool: lastTool || undefined,
+      toolCallCount: toolCallCount || undefined,
+      stopReason,
+    });
 
     const onLine = (line: string) => {
       let msg: {
@@ -334,6 +356,9 @@ export class GrokAcpClient {
           update?: {
             sessionUpdate?: string;
             content?: { type?: string; text?: string };
+            toolName?: string;
+            title?: string;
+            status?: string;
             stop_reason?: string;
             usage?: {
               inputTokens?: number;
@@ -368,19 +393,25 @@ export class GrokAcpClient {
         if (lastThought.length > 800) {
           lastThought = lastThought.slice(-800);
         }
+      } else {
+        const toolLabel = update.toolName ?? update.title;
+        const isTool =
+          update.sessionUpdate === "tool_call" ||
+          update.sessionUpdate === "tool_call_update" ||
+          /tool/i.test(update.sessionUpdate) ||
+          Boolean(toolLabel);
+        if (isTool) {
+          if (update.sessionUpdate !== "tool_call_update") {
+            toolCallCount += 1;
+          }
+          if (toolLabel) lastTool = toolLabel;
+          if (!lastThought && lastTool) lastThought = lastTool;
+        }
       }
-      input.onProgress?.({
-        updatedAt: new Date().toISOString(),
-        eventCount,
-        textSnippet: text.slice(-500) || undefined,
-        lastThought: lastThought.slice(-400) || undefined,
-      });
+      input.onProgress?.(progressSnapshot());
     };
 
-    // Temporary line listener for this prompt only.
     const rlHandler = (line: string) => onLine(line);
-    this.readline?.on("line", rlHandler);
-
     const abortHandler = () => {
       try {
         this.write({
@@ -392,9 +423,22 @@ export class GrokAcpClient {
         // ignore
       }
     };
-    input.signal?.addEventListener("abort", abortHandler, { once: true });
 
     try {
+      await this.ensureStarted();
+      if (input.signal?.aborted) {
+        return {
+          text: "",
+          sessionId: input.sessionId,
+          cancelled: true,
+          isError: true,
+          error: "Cancelled before start",
+        };
+      }
+
+      this.readline?.on("line", rlHandler);
+      input.signal?.addEventListener("abort", abortHandler, { once: true });
+
       const result = (await this.request(
         "session/prompt",
         {
@@ -447,13 +491,7 @@ export class GrokAcpClient {
           cancelled: true,
           isError: true,
           error: "Cancelled",
-          progress: {
-            updatedAt: new Date().toISOString(),
-            eventCount,
-            textSnippet: text.slice(-500) || undefined,
-            lastThought: lastThought.slice(-400) || undefined,
-            stopReason,
-          },
+          progress: progressSnapshot(),
         };
       }
 
@@ -462,13 +500,7 @@ export class GrokAcpClient {
         sessionId: input.sessionId,
         stopReason,
         metrics,
-        progress: {
-          updatedAt: new Date().toISOString(),
-          eventCount,
-          textSnippet: text.slice(-500) || undefined,
-          lastThought: lastThought.slice(-400) || undefined,
-          stopReason,
-        },
+        progress: progressSnapshot(),
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -482,16 +514,12 @@ export class GrokAcpClient {
         timedOut,
         cancelled: input.signal?.aborted,
         error: message,
-        progress: {
-          updatedAt: new Date().toISOString(),
-          eventCount,
-          textSnippet: text.slice(-500) || undefined,
-          lastThought: lastThought.slice(-400) || undefined,
-        },
+        progress: progressSnapshot(),
       };
     } finally {
       this.readline?.off("line", rlHandler);
       input.signal?.removeEventListener("abort", abortHandler);
+      this.promptDepth -= 1;
       this.touch();
     }
   }
