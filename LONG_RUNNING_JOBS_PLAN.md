@@ -356,9 +356,10 @@ Intended reviewer/critic/planner permissions (post-stack): `--always-approve`
 with the read-only sandbox. This docs change does not alter those flags.
 
 Callers: ordinary diffs use sync tools. Use `*_async` + `peer_job_status` when
-the host MCP timeout is ≤ ~3 minutes, the prompt is huge/truncated, or
-`risk_level=high` / `focus=security`. Sync results may include additive
-`durationAdvisory`; the server does **not** auto-upgrade sync calls into jobs.
+the host MCP timeout is ≤ ~3 minutes, the prompt is ≥ ~80k chars (~20k tokens),
+near the 120k cap, or truncated, or `risk_level=high` / `focus=security`. Sync
+results may include additive `durationAdvisory`; the server does **not**
+auto-upgrade sync calls into jobs.
 
 ## Idempotency — done
 

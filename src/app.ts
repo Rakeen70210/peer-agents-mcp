@@ -656,16 +656,25 @@ export function createApp(options: AppOptions = {}) {
       rawPrompt: string,
       truncated: boolean,
       peerResult: PeerRunResult,
-      extra?: { isError?: boolean; timedOut?: boolean; cancelled?: boolean },
-    ): TurnResult =>
-      toTurnResult(session, peerResult, {
-        ...extra,
+      extra?: {
+        isError?: boolean;
+        timedOut?: boolean;
+        cancelled?: boolean;
+        nativeResumeSpawn?: boolean;
+      },
+    ): TurnResult => {
+      const { nativeResumeSpawn, ...turnFlags } = extra ?? {};
+      return toTurnResult(session, peerResult, {
+        ...turnFlags,
         truncatedPrompt: truncated,
         estimatedTokens: estimateContextTokens([rawPrompt]),
         riskLevel: runOptions?.riskLevel,
         focus: runOptions?.focus,
-        autoContinued: !hadNative && peerResult.resumed === true,
+        // Auto-continue sets resumed on the spawn that ran it. A failed
+        // --resume that falls through to a cold start is not a native-resume spawn.
+        autoContinued: !nativeResumeSpawn && peerResult.resumed === true,
       });
+    };
 
     if (canResume) {
       const rawPrompt = buildPrompt(session, input, { nativeResume: true });
@@ -683,6 +692,7 @@ export function createApp(options: AppOptions = {}) {
         return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
           cancelled: true,
+          nativeResumeSpawn: true,
         });
       }
       if (resumed.timedOut || resumed.incompleteReview) {
@@ -690,16 +700,20 @@ export function createApp(options: AppOptions = {}) {
         return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
           timedOut: resumed.timedOut,
+          nativeResumeSpawn: true,
         });
       }
       if (!resumed.isError) {
         await recordTurn(session, userMessageForTranscript, resumed);
-        return finish(rawPrompt, compact.truncated, resumed);
+        return finish(rawPrompt, compact.truncated, resumed, {
+          nativeResumeSpawn: true,
+        });
       }
       if (!isLikelyResumeFailure(resumed)) {
         await persistNativeSession(session, resumed);
         return finish(rawPrompt, compact.truncated, resumed, {
           isError: true,
+          nativeResumeSpawn: true,
         });
       }
       // Native session lost — fall back to MCP transcript rehydrate.

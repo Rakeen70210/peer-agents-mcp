@@ -56,7 +56,7 @@ The server does **not** silently convert sync tools into jobs.
 
 | Use sync (`peer_review_diff`, `peer_plan`, `peer_turn`, …) | Use async (`*_async` + `peer_job_status`) |
 | --- | --- |
-| Ordinary diffs / plans that fit in ~80k prompt chars | Prompt near `PEER_AGENTS_MAX_PROMPT_CHARS` (120k) or truncated |
+| Ordinary diffs / plans that fit in ~80k prompt chars | ≥ ~80k chars (~20k tokens), near the 120k cap, or truncated |
 | Default / medium risk | `risk_level=high` or `focus=security` (`--effort high`) |
 | Follow-up “re-check this one file” | Implementation handoff (`peer_implement_async`) |
 | Host can wait ~6 minutes | Host MCP timeout ≤ 2–3 minutes; huge logs; multi-attempt debug |

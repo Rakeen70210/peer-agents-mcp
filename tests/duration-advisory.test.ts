@@ -150,6 +150,96 @@ test("auto-continue (resumed on grok cold start) emits durationAdvisory", async 
   assert.equal(result.durationAdvisory, ADVISORY);
 });
 
+test("auto-continue after failed native resume still emits durationAdvisory", async () => {
+  const natives: Array<string | undefined> = [];
+  const grok: PeerProvider = {
+    name: "grok",
+    healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+    runTurn: async (input) => {
+      natives.push(input.nativeSessionId);
+      if (input.nativeSessionId) {
+        return {
+          isError: true,
+          text: "",
+          stdout: "",
+          stderr: "Couldn't start session: not found",
+          nativeSessionId: input.nativeSessionId,
+          resumed: false,
+        };
+      }
+      const autoContinued = natives.length > 1;
+      return {
+        isError: false,
+        text: autoContinued ? "recovered after resume fallback" : "first",
+        stdout: autoContinued ? "recovered after resume fallback" : "first",
+        stderr: "",
+        nativeSessionId: input.assignedSessionId ?? "native-1",
+        resumed: autoContinued,
+      };
+    },
+  };
+  const app = await appWith(grok);
+  const started = await app.start({
+    provider: "grok",
+    task: "review",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  const first = await app.turn({
+    sessionId: started.sessionId,
+    message: "first",
+    idempotencyKey: "adv-fb-1",
+  });
+  assert.equal(first.durationAdvisory, undefined);
+  const result = await app.turn({
+    sessionId: started.sessionId,
+    message: "follow-up after crash",
+    idempotencyKey: "adv-fb-2",
+    expectedVersion: 1,
+  });
+  assert.equal(natives.length, 3);
+  assert.equal(typeof natives[1], "string");
+  assert.equal(natives[2], undefined);
+  assert.equal(result.resumed, true);
+  assert.equal(result.durationAdvisory, ADVISORY);
+});
+
+test("successful native resume does not emit durationAdvisory from resumed alone", async () => {
+  const grok: PeerProvider = {
+    name: "grok",
+    healthCheck: async () => ({ ok: true, latencyMs: 1 }),
+    runTurn: async (input) => ({
+      isError: false,
+      text: "ok",
+      stdout: "ok",
+      stderr: "",
+      nativeSessionId:
+        input.nativeSessionId ?? input.assignedSessionId ?? "native-1",
+      resumed: Boolean(input.nativeSessionId),
+    }),
+  };
+  const app = await appWith(grok);
+  const started = await app.start({
+    provider: "grok",
+    task: "review",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  await app.turn({
+    sessionId: started.sessionId,
+    message: "first",
+    idempotencyKey: "adv-resume-1",
+  });
+  const second = await app.turn({
+    sessionId: started.sessionId,
+    message: "follow-up",
+    idempotencyKey: "adv-resume-2",
+    expectedVersion: 1,
+  });
+  assert.equal(second.resumed, true);
+  assert.equal(second.durationAdvisory, undefined);
+});
+
 test("compare copies durationAdvisory onto the grok provider result", async () => {
   const app = await appWith(fakeGrok({ resumed: true }));
   const compared = await app.compare({
