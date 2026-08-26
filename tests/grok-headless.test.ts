@@ -14,12 +14,31 @@ import {
   sanitizeWorktreeName,
 } from "../src/providers/grok-headless.js";
 import { formatStructuredAsText } from "../src/providers/grok-schema.js";
+import { runCommand } from "../src/providers/runner.js";
 import {
   DEFAULT_GROK_TURN_TIMEOUT_MS,
   grokAcpIdleTimeoutMs,
   grokTurnTimeoutMs,
   HEALTH_TURN_TIMEOUT_MS,
 } from "../src/providers/grok-timeout.js";
+
+function isolateEnv(
+  t: { after: (fn: () => void) => void },
+  updates: Record<string, string | undefined>,
+): void {
+  const previous: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(updates)) {
+    previous[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
 
 function mintedSessionId(captured: string): string | undefined {
   const fromFlag = captured.match(/--session-id\n([^\n]+)/);
@@ -410,6 +429,15 @@ test("isLikelyResumeFailure detects session errors", () => {
     }),
     false,
   );
+  assert.equal(
+    isLikelyResumeFailure({
+      isError: true,
+      text: "",
+      stdout: "",
+      stderr: "spawn grok ENOENT",
+    }),
+    true,
+  );
 });
 
 test("sanitizeWorktreeName strips unsafe chars", () => {
@@ -741,83 +769,84 @@ test("timeout with thought and tool_call returns progress and minted session id"
   assert.doesNotMatch(captured, /HAD_RESUME/);
 });
 
-test("with GROK_TURN_TIMEOUT_MS unset and PEER_AGENTS_TURN_TIMEOUT_MS=120000, captured runCommand timeoutMs is 360000", async () => {
-  const prevGrok = process.env.GROK_TURN_TIMEOUT_MS;
-  const prevPeer = process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
-  delete process.env.GROK_TURN_TIMEOUT_MS;
-  process.env.PEER_AGENTS_TURN_TIMEOUT_MS = "120000";
-  const capturedTimeouts: number[] = [];
-  const realSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = ((fn: TimerHandler, ms?: number, ...args: unknown[]) => {
-    if (typeof ms === "number") capturedTimeouts.push(ms);
-    return realSetTimeout(fn as never, ms as never, ...(args as never[]));
-  }) as typeof setTimeout;
-  try {
-    assert.equal(grokTurnTimeoutMs(), DEFAULT_GROK_TURN_TIMEOUT_MS);
-    const dir = await mkdtemp(join(tmpdir(), "peer-grok-default-to-"));
-    const { scriptPath } = await makeCaptureCli(dir, { text: "ok", sessionId: "s" });
-    const provider = new GrokHeadlessProvider({
-      command: scriptPath,
-      promptDir: join(dir, "prompts"),
-    });
-    await provider.runTurn({
-      constructedPrompt: "Review",
-      mode: "reviewer",
-      structuredOutput: false,
-    });
-    assert.ok(
-      capturedTimeouts.includes(DEFAULT_GROK_TURN_TIMEOUT_MS),
-      `expected ${DEFAULT_GROK_TURN_TIMEOUT_MS} in ${capturedTimeouts.join(",")}`,
-    );
-    assert.equal(capturedTimeouts.includes(120_000), false);
-    assert.equal(jobTimeoutMsFor("grok"), 1_800_000);
-    assert.ok(grokAcpIdleTimeoutMs() >= grokTurnTimeoutMs() + 60_000);
-  } finally {
-    globalThis.setTimeout = realSetTimeout;
-    if (prevGrok === undefined) delete process.env.GROK_TURN_TIMEOUT_MS;
-    else process.env.GROK_TURN_TIMEOUT_MS = prevGrok;
-    if (prevPeer === undefined) delete process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
-    else process.env.PEER_AGENTS_TURN_TIMEOUT_MS = prevPeer;
-  }
+test("grokTurnTimeoutMs ignores PEER_AGENTS_TURN_TIMEOUT_MS", (t) => {
+  isolateEnv(t, {
+    GROK_TURN_TIMEOUT_MS: undefined,
+    PEER_AGENTS_TURN_TIMEOUT_MS: "120000",
+  });
+  assert.equal(grokTurnTimeoutMs(), DEFAULT_GROK_TURN_TIMEOUT_MS);
+  assert.equal(jobTimeoutMsFor("grok"), 1_800_000);
+  assert.ok(grokAcpIdleTimeoutMs() >= grokTurnTimeoutMs() + 60_000);
 });
 
-test("GROK_TURN_TIMEOUT_MS=5000 wins; a 1s fake survives and an 8s fake times out", async () => {
-  const prev = process.env.GROK_TURN_TIMEOUT_MS;
-  process.env.GROK_TURN_TIMEOUT_MS = "5000";
-  try {
-    const dir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-"));
-    const fast = await makeStreamingCli(dir, [{ type: "text", data: "ok" }, { type: "end" }], {
-      sleepMs: 1000,
-    });
-    const slowDir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-slow-"));
-    const slow = await makeStreamingCli(slowDir, [{ type: "thought", data: "hmm" }], {
-      sleepMs: 8000,
-    });
-    const fastProvider = new GrokHeadlessProvider({
-      command: fast.scriptPath,
-      promptDir: join(dir, "prompts"),
-    });
-    const slowProvider = new GrokHeadlessProvider({
-      command: slow.scriptPath,
-      promptDir: join(slowDir, "prompts"),
-    });
-    const survived = await fastProvider.runTurn({
-      constructedPrompt: "Review",
-      mode: "reviewer",
-      structuredOutput: false,
-    });
-    assert.equal(survived.timedOut, undefined);
-    assert.equal(survived.isError, false);
-    const timed = await slowProvider.runTurn({
-      constructedPrompt: "Review",
-      mode: "reviewer",
-      structuredOutput: false,
-    });
-    assert.equal(timed.timedOut, true);
-  } finally {
-    if (prev === undefined) delete process.env.GROK_TURN_TIMEOUT_MS;
-    else process.env.GROK_TURN_TIMEOUT_MS = prev;
-  }
+test("GROK_TURN_TIMEOUT_MS wins over PEER_AGENTS_TURN_TIMEOUT_MS", (t) => {
+  isolateEnv(t, {
+    GROK_TURN_TIMEOUT_MS: "5000",
+    PEER_AGENTS_TURN_TIMEOUT_MS: "120000",
+  });
+  assert.equal(grokTurnTimeoutMs(), 5_000);
+});
+
+test("with GROK_TURN_TIMEOUT_MS unset and PEER_AGENTS_TURN_TIMEOUT_MS=120000, captured runCommand timeoutMs is 360000", async (t) => {
+  isolateEnv(t, {
+    GROK_TURN_TIMEOUT_MS: undefined,
+    PEER_AGENTS_TURN_TIMEOUT_MS: "120000",
+  });
+  const capturedTimeouts: number[] = [];
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-default-to-"));
+  const { scriptPath } = await makeCaptureCli(dir, { text: "ok", sessionId: "s" });
+  const provider = new GrokHeadlessProvider({
+    command: scriptPath,
+    promptDir: join(dir, "prompts"),
+    runCommand: async (options) => {
+      capturedTimeouts.push(options.timeoutMs);
+      return runCommand(options);
+    },
+  });
+  await provider.runTurn({
+    constructedPrompt: "Review",
+    mode: "reviewer",
+    structuredOutput: false,
+  });
+  assert.ok(
+    capturedTimeouts.includes(DEFAULT_GROK_TURN_TIMEOUT_MS),
+    `expected ${DEFAULT_GROK_TURN_TIMEOUT_MS} in ${capturedTimeouts.join(",")}`,
+  );
+  assert.equal(capturedTimeouts.includes(120_000), false);
+});
+
+test("timeoutMs 5000: a 1s fake survives and an 8s fake times out", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-"));
+  const fast = await makeStreamingCli(dir, [{ type: "text", data: "ok" }, { type: "end" }], {
+    sleepMs: 1000,
+  });
+  const slowDir = await mkdtemp(join(tmpdir(), "peer-grok-env-to-slow-"));
+  const slow = await makeStreamingCli(slowDir, [{ type: "thought", data: "hmm" }], {
+    sleepMs: 8000,
+  });
+  const fastProvider = new GrokHeadlessProvider({
+    command: fast.scriptPath,
+    promptDir: join(dir, "prompts"),
+    timeoutMs: 5_000,
+  });
+  const slowProvider = new GrokHeadlessProvider({
+    command: slow.scriptPath,
+    promptDir: join(slowDir, "prompts"),
+    timeoutMs: 5_000,
+  });
+  const survived = await fastProvider.runTurn({
+    constructedPrompt: "Review",
+    mode: "reviewer",
+    structuredOutput: false,
+  });
+  assert.equal(survived.timedOut, undefined);
+  assert.equal(survived.isError, false);
+  const timed = await slowProvider.runTurn({
+    constructedPrompt: "Review",
+    mode: "reviewer",
+    structuredOutput: false,
+  });
+  assert.equal(timed.timedOut, true);
 });
 
 test("healthCheck fallback runTurn uses 15s timeout", async () => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,7 +20,7 @@ import {
  */
 async function writeFakeAcp(
   dir: string,
-  options?: { promptDelayMs?: number; emitToolCall?: boolean },
+  options?: { promptDelayMs?: number; emitToolCall?: boolean; cancelFile?: string },
 ) {
   const script = join(dir, "fake-acp.sh");
   // Node one-liner as fake agent for richer state.
@@ -29,8 +29,10 @@ async function writeFakeAcp(
     agent,
     `
 import readline from "node:readline";
+import { appendFileSync } from "node:fs";
 const sessions = new Set();
 let nextId = 1;
+const cancelFile = ${JSON.stringify(options?.cancelFile ?? "")};
 const rl = readline.createInterface({ input: process.stdin });
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\\n");
@@ -88,6 +90,9 @@ rl.on("line", (line) => {
     return;
   }
   if (msg.method === "session/cancel") {
+    if (cancelFile) {
+      appendFileSync(cancelFile, "CANCEL " + (msg.params?.sessionId || "") + "\\n");
+    }
     return;
   }
   if (msg.id !== undefined) {
@@ -300,20 +305,46 @@ test("ACP collector increments toolCallCount on tool-call updates", async () => 
   }
 });
 
-test("GrokAcpProvider default timeout uses grokTurnTimeoutMs", () => {
+test("GrokAcpProvider default timeout uses grokTurnTimeoutMs", (t) => {
   const prevGrok = process.env.GROK_TURN_TIMEOUT_MS;
   const prevPeer = process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
-  delete process.env.GROK_TURN_TIMEOUT_MS;
-  process.env.PEER_AGENTS_TURN_TIMEOUT_MS = "120000";
-  try {
-    assert.equal(grokTurnTimeoutMs(), DEFAULT_GROK_TURN_TIMEOUT_MS);
-    const provider = new GrokAcpProvider({ timeoutMs: grokTurnTimeoutMs() });
-    assert.equal(grokTurnTimeoutMs(), 360_000);
-    void provider;
-  } finally {
+  t.after(() => {
     if (prevGrok === undefined) delete process.env.GROK_TURN_TIMEOUT_MS;
     else process.env.GROK_TURN_TIMEOUT_MS = prevGrok;
     if (prevPeer === undefined) delete process.env.PEER_AGENTS_TURN_TIMEOUT_MS;
     else process.env.PEER_AGENTS_TURN_TIMEOUT_MS = prevPeer;
+  });
+  delete process.env.GROK_TURN_TIMEOUT_MS;
+  process.env.PEER_AGENTS_TURN_TIMEOUT_MS = "120000";
+  assert.equal(grokTurnTimeoutMs(), DEFAULT_GROK_TURN_TIMEOUT_MS);
+  const provider = new GrokAcpProvider({ timeoutMs: grokTurnTimeoutMs() });
+  assert.equal(grokTurnTimeoutMs(), 360_000);
+  void provider;
+});
+
+test("ACP prompt timeout sends session/cancel and drops liveSessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "peer-acp-timeout-cancel-"));
+  const cancelFile = join(dir, "cancel.txt");
+  const command = await writeFakeAcp(dir, { promptDelayMs: 2000, cancelFile });
+  const client = new GrokAcpClient({ command, idleTimeoutMs: 60_000 });
+  try {
+    const sid = await client.createSession(dir);
+    const result = await client.prompt({
+      sessionId: sid,
+      text: "hello",
+      timeoutMs: 200,
+    });
+    assert.equal(result.timedOut, true);
+    assert.equal(client.liveSessions.has(sid), false);
+    const deadline = Date.now() + 2000;
+    let cancelLog = "";
+    while (Date.now() < deadline) {
+      cancelLog = await readFile(cancelFile, "utf8").catch(() => "");
+      if (cancelLog.includes("CANCEL")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.match(cancelLog, /CANCEL/);
+  } finally {
+    await client.dispose();
   }
 });

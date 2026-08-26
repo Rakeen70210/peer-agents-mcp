@@ -449,3 +449,62 @@ test("agy timeout must not persist a random UUID nativeSessionId", async () => {
   };
   assert.equal(stored.nativeSessionId, undefined);
 });
+
+test("spawn ENOENT after persist-before-spawn does not keep minted nativeSessionId", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peer-enoent-"));
+  const assigned: string[] = [];
+  class MissingGrok implements PeerProvider {
+    readonly name = "grok" as const;
+    async healthCheck() {
+      return { ok: true, latencyMs: 1 };
+    }
+    async runTurn(input: PeerRunInput): Promise<PeerRunResult> {
+      assigned.push(input.assignedSessionId ?? "");
+      return {
+        isError: true,
+        text: "",
+        stdout: "",
+        stderr: "spawn grok ENOENT",
+        nativeSessionId: input.assignedSessionId,
+      };
+    }
+  }
+  const grok = new MissingGrok();
+  const app = createApp({
+    storageDir,
+    providers: {
+      grok,
+      antigravity: new RecordingGrok([{ text: "n/a" }]),
+    },
+  });
+  await app.hydrate();
+  const started = await app.start({
+    provider: "grok",
+    task: "review",
+    repoPath: "/tmp/repo",
+    mode: "reviewer",
+  });
+  const result = await app.turn({
+    sessionId: started.sessionId,
+    message: "Please review",
+    idempotencyKey: "enoent-1",
+  });
+  assert.equal(result.isError, true);
+  assert.ok(assigned[0]);
+  const files = await readdir(storageDir);
+  const sessionFile = files.find((file) => file.endsWith(".json"));
+  assert.ok(sessionFile);
+  const stored = JSON.parse(await readFile(join(storageDir, sessionFile!), "utf8")) as {
+    nativeSessionId?: string;
+  };
+  assert.equal(stored.nativeSessionId, undefined);
+
+  await app.turn({
+    sessionId: started.sessionId,
+    message: "retry",
+    idempotencyKey: "enoent-2",
+  });
+  assert.equal(assigned.length, 2);
+  assert.ok(assigned[1]);
+  assert.notEqual(assigned[1], assigned[0]);
+});

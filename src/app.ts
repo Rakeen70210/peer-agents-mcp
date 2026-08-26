@@ -121,7 +121,7 @@ type PeerTurnOptions = {
   /** Override structured output (default from provider profile). */
   structuredOutput?: boolean;
   selfVerify?: boolean;
-  /** Enable Grok streaming-json / agy stream-json progress (async jobs). */
+  /** Progress callbacks. Grok always streams; Agy uses stream-json vs json. */
   streamProgress?: boolean;
   onProgress?: (progress: PeerRunProgress) => void;
 };
@@ -716,6 +716,10 @@ export function createApp(options: AppOptions = {}) {
         session.worktreeName = peerResult.worktreeName;
       }
       await recordTurn(session, userMessageForTranscript, peerResult);
+    } else if (isLikelyResumeFailure(peerResult)) {
+      // Spawn never started (e.g. ENOENT) — do not keep a pre-minted UUID.
+      session.nativeSessionId = undefined;
+      await persist(session);
     } else {
       await persistNativeSession(session, peerResult);
     }

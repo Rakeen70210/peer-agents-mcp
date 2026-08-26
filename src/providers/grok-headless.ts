@@ -37,6 +37,8 @@ import type {
   PeerRunResult,
 } from "./types.js";
 
+type RunCommandFn = typeof runCommand;
+
 type GrokJsonResponse = {
   text?: string;
   sessionId?: string;
@@ -65,6 +67,8 @@ export type GrokProviderOptions = {
   promptDir?: string;
   /** Override git worktree parent directory (tests). */
   worktreeRoot?: string;
+  /** Override spawn (tests). */
+  runCommand?: RunCommandFn;
 };
 
 export class GrokHeadlessProvider implements PeerProvider {
@@ -74,6 +78,7 @@ export class GrokHeadlessProvider implements PeerProvider {
   private readonly timeoutMs: number;
   private readonly promptDir: string;
   private readonly worktreeRoot?: string;
+  private readonly runCommand: RunCommandFn;
 
   constructor(options: GrokProviderOptions = {}) {
     this.command = options.command ?? process.env.GROK_COMMAND ?? "grok";
@@ -86,12 +91,13 @@ export class GrokHeadlessProvider implements PeerProvider {
       join(tmpdir(), "peer-agents-prompts");
     this.worktreeRoot =
       options.worktreeRoot ?? process.env.PEER_AGENTS_WORKTREE_DIR;
+    this.runCommand = options.runCommand ?? runCommand;
   }
 
   async healthCheck() {
     const started = Date.now();
     // Lightweight probe: avoid a full agent turn when `version` works.
-    const versionProbe = await runCommand({
+    const versionProbe = await this.runCommand({
       command: this.command,
       args: ["--version"],
       timeoutMs: HEALTH_TURN_TIMEOUT_MS,
@@ -262,7 +268,7 @@ export class GrokHeadlessProvider implements PeerProvider {
 
       const streamState = createStreamAccumulator(input.onProgress);
 
-      const result = await runCommand({
+      const result = await this.runCommand({
         command: this.command,
         args,
         cwd: input.cwd,
@@ -663,7 +669,8 @@ export function isLikelyResumeFailure(result: PeerRunResult): boolean {
     blob.includes("unknown session") ||
     blob.includes("invalid session") ||
     blob.includes("unknown conversation") ||
-    blob.includes("invalid conversation")
+    blob.includes("invalid conversation") ||
+    blob.includes("enoent")
   );
 }
 

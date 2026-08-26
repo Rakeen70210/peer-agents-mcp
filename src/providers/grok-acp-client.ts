@@ -241,6 +241,19 @@ export class GrokAcpClient {
     this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
+  private sendSessionCancel(sessionId: string): void {
+    try {
+      this.write({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId },
+      });
+    } catch {
+      // ignore
+    }
+    this.liveSessions.delete(sessionId);
+  }
+
   private request(method: string, params?: unknown, timeoutMs = 60_000): Promise<unknown> {
     this.promptDepth += 1;
     this.touch();
@@ -252,6 +265,10 @@ export class GrokAcpClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        if (method === "session/prompt") {
+          const sid = (params as { sessionId?: string } | undefined)?.sessionId;
+          if (sid) this.sendSessionCancel(sid);
+        }
         settle();
         reject(new Error(`ACP request timed out: ${method}`));
       }, timeoutMs);
@@ -413,15 +430,7 @@ export class GrokAcpClient {
 
     const rlHandler = (line: string) => onLine(line);
     const abortHandler = () => {
-      try {
-        this.write({
-          jsonrpc: "2.0",
-          method: "session/cancel",
-          params: { sessionId: input.sessionId },
-        });
-      } catch {
-        // ignore
-      }
+      this.sendSessionCancel(input.sessionId);
     };
 
     try {
@@ -505,6 +514,9 @@ export class GrokAcpClient {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const timedOut = /timed out/i.test(message);
+      if (timedOut || input.signal?.aborted) {
+        this.sendSessionCancel(input.sessionId);
+      }
       return {
         text: text.trim(),
         sessionId: input.sessionId,

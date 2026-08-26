@@ -73,7 +73,8 @@ export type PeerRunInput = {
   /** Extra self-verify instruction in `--rules` (Grok `--check` was removed in 1.0). */
   selfVerify?: boolean;
   /**
-   * Use Grok `streaming-json` / agy `stream-json` and report progress (async jobs).
+   * Enable progress callbacks. Grok headless always uses `streaming-json`;
+   * this flag only selects Agy `stream-json` vs `json`.
    * Final result still aggregates full text + end-event metadata.
    */
   streamProgress?: boolean;
